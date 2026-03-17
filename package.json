@@ -1,0 +1,24 @@
+{
+  "name": "stremio-rd-addon",
+  "version": "1.0.0",
+  "description": "Browse and stream your Real-Debrid library from Stremio",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "stremio",
+    "addon",
+    "real-debrid"
+  ],
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "parse-torrent-title": "^2.1.0",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}
