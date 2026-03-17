@@ -323,6 +323,8 @@ function getConfigurePage(savedToken, settings) {
         <h1>Real-Debrid Streams</h1>
         <p class="subtitle">Stream torrents from your Real-Debrid library for any movie or series</p>
 
+        <div class="section-label">Real-Debrid Account</div>
+
         ${hasSavedToken ? `
         <div class="saved-token">
             <div class="label">Saved Token</div>
@@ -330,10 +332,26 @@ function getConfigurePage(savedToken, settings) {
         </div>
         ` : ''}
 
-        <div class="section-label">${hasSavedToken ? 'Update Token' : 'API Token'}</div>
-        <input type="password" id="token" placeholder="Paste your Real-Debrid API token" />
-        <div class="hint">
-            Get your token from <a href="https://real-debrid.com/apitoken" target="_blank">real-debrid.com/apitoken</a>
+        <button class="btn-secondary" id="btnDeviceAuth" onclick="startDeviceAuth()">Login with Real-Debrid</button>
+
+        <div id="deviceAuthFlow" style="display:none; margin-top:16px;">
+            <div style="padding:16px; background:#0d0d1a; border-radius:6px; text-align:center;">
+                <p style="color:#999; margin-bottom:8px;">Go to:</p>
+                <a id="authUrl" href="#" target="_blank" style="color:#00c853; font-size:18px; font-weight:700;"></a>
+                <p style="color:#999; margin:12px 0 8px;">Enter code:</p>
+                <div id="authCode" style="font-size:28px; font-weight:700; color:#fff; letter-spacing:4px; font-family:monospace;"></div>
+                <p id="authStatus" style="color:#999; margin-top:12px; font-size:13px;">Waiting for authorization...</p>
+            </div>
+        </div>
+
+        <div style="margin-top:12px;">
+            <details>
+                <summary style="color:#666; font-size:12px; cursor:pointer;">Or paste API token manually</summary>
+                <div style="margin-top:8px;">
+                    <input type="password" id="token" placeholder="Paste your Real-Debrid API token" />
+                    <div class="hint">Get your token from <a href="https://real-debrid.com/apitoken" target="_blank">real-debrid.com/apitoken</a></div>
+                </div>
+            </details>
         </div>
 
         <hr class="divider">
@@ -400,6 +418,7 @@ function getConfigurePage(savedToken, settings) {
     <script>
         var HOST = window.location.origin;
         var TUNNEL = ${JSON.stringify(tunnelUrl)};
+        var authPollTimer = null;
         var MANIFEST_URL = TUNNEL ? TUNNEL + '/manifest.json' : 'http://localhost:${port}/manifest.json';
 
         var SORT_CRITERIA = {
@@ -527,6 +546,62 @@ function getConfigurePage(savedToken, settings) {
                 showStatus('Copy the link below manually.', '');
             });
         }
+
+        function startDeviceAuth() {
+            document.getElementById('btnDeviceAuth').disabled = true;
+            document.getElementById('btnDeviceAuth').textContent = 'Starting...';
+
+            fetch(HOST + '/api/auth/device-code', { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.error) {
+                    showStatus(data.error, 'error');
+                    document.getElementById('btnDeviceAuth').disabled = false;
+                    document.getElementById('btnDeviceAuth').textContent = 'Login with Real-Debrid';
+                    return;
+                }
+
+                document.getElementById('deviceAuthFlow').style.display = 'block';
+                document.getElementById('authUrl').href = data.verification_url;
+                document.getElementById('authUrl').textContent = data.verification_url;
+                document.getElementById('authCode').textContent = data.user_code;
+                document.getElementById('authStatus').textContent = 'Waiting for authorization...';
+                document.getElementById('authStatus').style.color = '#999';
+
+                if (authPollTimer) clearInterval(authPollTimer);
+                authPollTimer = setInterval(pollDeviceAuth, 5000);
+            })
+            .catch(function() {
+                showStatus('Failed to start authentication', 'error');
+                document.getElementById('btnDeviceAuth').disabled = false;
+                document.getElementById('btnDeviceAuth').textContent = 'Login with Real-Debrid';
+            });
+        }
+
+        function pollDeviceAuth() {
+            fetch(HOST + '/api/auth/poll')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                if (data.status === 'authorized') {
+                    clearInterval(authPollTimer);
+                    authPollTimer = null;
+                    document.getElementById('authStatus').textContent = 'Authorized! Logged in as ' + data.username;
+                    document.getElementById('authStatus').style.color = '#00c853';
+                    showStatus('Logged in as ' + data.username, 'success');
+                    setTimeout(function() { window.location.reload(); }, 2000);
+                } else if (data.status === 'error') {
+                    clearInterval(authPollTimer);
+                    authPollTimer = null;
+                    document.getElementById('authStatus').textContent = data.message || 'Authorization failed';
+                    document.getElementById('authStatus').style.color = '#f44336';
+                    document.getElementById('btnDeviceAuth').disabled = false;
+                    document.getElementById('btnDeviceAuth').textContent = 'Login with Real-Debrid';
+                }
+            })
+            .catch(function() {
+                // Network error - keep polling
+            });
+        }
     </script>
 </body>
 </html>`;
@@ -579,6 +654,97 @@ app.post('/api/save-config', async (req, res) => {
 
     config.saveLocalConfig(toSave);
     res.json({ success: true, username });
+});
+
+// --- Device Code OAuth Flow ---
+const RD_OAUTH_CLIENT_ID = 'X245A4XAIBGVM';
+let pendingDeviceCode = null;
+
+// Start device code auth flow
+app.post('/api/auth/device-code', async (req, res) => {
+    try {
+        const response = await fetch(
+            `https://api.real-debrid.com/oauth/v2/device/code?client_id=${RD_OAUTH_CLIENT_ID}&new_credentials=yes`,
+            { signal: AbortSignal.timeout(15000) }
+        );
+        if (!response.ok) {
+            const text = await response.text();
+            return res.json({ error: `Real-Debrid error: ${text}` });
+        }
+        const data = await response.json();
+        pendingDeviceCode = data.device_code;
+        res.json({
+            user_code: data.user_code,
+            verification_url: data.verification_url,
+            direct_verification_url: data.direct_verification_url,
+            expires_in: data.expires_in,
+        });
+    } catch (err) {
+        console.error('[auth] Device code request failed:', err.message);
+        res.json({ error: 'Failed to start authentication. Try again.' });
+    }
+});
+
+// Poll for device auth completion
+app.get('/api/auth/poll', async (req, res) => {
+    if (!pendingDeviceCode) {
+        return res.json({ status: 'error', message: 'No authentication in progress.' });
+    }
+
+    try {
+        // Step 1: Check if user has authorized
+        const credRes = await fetch(
+            `https://api.real-debrid.com/oauth/v2/device/credentials?client_id=${RD_OAUTH_CLIENT_ID}&code=${pendingDeviceCode}`,
+            { signal: AbortSignal.timeout(15000) }
+        );
+
+        if (credRes.status === 403) {
+            return res.json({ status: 'pending' });
+        }
+
+        if (!credRes.ok) {
+            pendingDeviceCode = null;
+            return res.json({ status: 'error', message: 'Authorization expired or failed.' });
+        }
+
+        const credentials = await credRes.json();
+
+        // Step 2: Exchange credentials for access token
+        const tokenRes = await fetch('https://api.real-debrid.com/oauth/v2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: credentials.client_id,
+                client_secret: credentials.client_secret,
+                code: pendingDeviceCode,
+                grant_type: 'http://oauth.net/grant_type/device/1.0',
+            }).toString(),
+            signal: AbortSignal.timeout(15000),
+        });
+
+        if (!tokenRes.ok) {
+            const text = await tokenRes.text();
+            pendingDeviceCode = null;
+            return res.json({ status: 'error', message: `Token exchange failed: ${text}` });
+        }
+
+        const tokenData = await tokenRes.json();
+        const accessToken = tokenData.access_token;
+        pendingDeviceCode = null;
+
+        // Step 3: Verify token and save
+        const user = await rd.getUser(accessToken);
+        config.rdApiToken = accessToken;
+        config.saveLocalConfig({ rdApiToken: accessToken });
+        remountStaticRoutes();
+        console.log(`[auth] OAuth login successful for user: ${user.username}`);
+
+        res.json({ status: 'authorized', username: user.username });
+    } catch (err) {
+        console.error('[auth] Poll error:', err.message);
+        pendingDeviceCode = null;
+        res.json({ status: 'error', message: 'Authentication failed. Please try again.' });
+    }
 });
 
 // Configure page
