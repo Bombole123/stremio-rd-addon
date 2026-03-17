@@ -85,6 +85,14 @@ echo "[6/7] Setting permissions..."
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 # ── 7. Create systemd service ────────────────────────────────
+# Cap journal logs at 100MB to prevent disk fill
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/size-limit.conf <<JEOF
+[Journal]
+SystemMaxUse=100M
+JEOF
+systemctl restart systemd-journald
+
 echo "[7/7] Creating systemd service..."
 cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]

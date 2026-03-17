@@ -168,6 +168,14 @@ PrivateTmp=true
 WantedBy=multi-user.target
 SVCEOF
 
+# Cap journal logs at 100MB to prevent disk fill
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/size-limit.conf <<JEOF
+[Journal]
+SystemMaxUse=100M
+JEOF
+systemctl restart systemd-journald
+
 systemctl daemon-reload
 systemctl enable stremio-addon --quiet
 systemctl start stremio-addon
