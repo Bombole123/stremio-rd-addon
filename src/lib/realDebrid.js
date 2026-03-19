@@ -166,8 +166,8 @@ async function checkInstantAvailability(token, hashes) {
         console.error('[rd] RD API instant availability check failed:', err.message);
     }
 
-    // Step 3: Fallback — add-magnet check (slow, limited to 15 hashes)
-    const limitedHashes = toQuery.slice(0, 15);
+    // Step 3: Fallback — add-magnet check (slow, limited to 10 hashes)
+    const limitedHashes = toQuery.slice(0, 10);
     console.log(`[rd] Trying add-magnet fallback for ${limitedHashes.length} hash(es)...`);
     try {
         const addResult = await checkViaAddFallback(token, limitedHashes);
@@ -213,24 +213,30 @@ async function checkViaRdApi(token, hashes) {
     return result;
 }
 
-// Fallback: Check cache by adding magnets one-by-one (slow but reliable).
-// Limited to a small batch to avoid rate-limiting. Uses Promise.allSettled for
-// concurrent execution so one failure doesn't block the rest.
+// Fallback: Check cache by adding magnets sequentially with a delay to avoid
+// rate-limiting. Stops early after 2 consecutive rate-limit errors.
 async function checkViaAddFallback(token, hashes) {
     const result = {};
+    let consecutiveRateLimits = 0;
 
-    const settled = await Promise.allSettled(
-        hashes.map(hash => checkCacheViaAdd(token, hash))
-    );
+    for (const rawHash of hashes) {
+        if (consecutiveRateLimits >= 2) {
+            console.log('[rd] Stopping add-magnet fallback — rate limited');
+            break;
+        }
 
-    for (let i = 0; i < hashes.length; i++) {
-        const outcome = settled[i];
-        const hash = hashes[i].toLowerCase();
+        const hash = rawHash.toLowerCase();
+        const cacheResult = await checkCacheViaAdd(token, hash);
 
-        if (outcome.status !== 'fulfilled' || !outcome.value) continue;
+        if (cacheResult === 'rate_limited') {
+            consecutiveRateLimits++;
+            continue;
+        }
+        consecutiveRateLimits = 0;
 
-        const { info } = outcome.value;
-        // Build availability map from the torrent's file list
+        if (!cacheResult) continue;
+
+        const { info } = cacheResult;
         const variant = {};
         if (info && info.files && info.files.length > 0) {
             for (const file of info.files) {
@@ -244,13 +250,16 @@ async function checkViaAddFallback(token, hashes) {
             variant[1] = { filename: 'cached', filesize: 0 };
         }
         result[hash] = { rd: [variant] };
+
+        // Small delay between requests to stay under rate limits
+        await new Promise(r => setTimeout(r, 300));
     }
 
     return result;
 }
 
-// Fallback: add magnet, select all files, check if already cached via torrent status.
-// Returns torrent info if cached, or null if not (and cleans up the added torrent).
+// Add magnet, select all files, check if already cached via torrent status.
+// Returns { torrentId, info } if cached, null if not cached, or 'rate_limited' on 429.
 async function checkCacheViaAdd(token, hash) {
     let torrentId = null;
     try {
@@ -263,8 +272,6 @@ async function checkCacheViaAdd(token, hash) {
 
         const info = await getTorrentInfo(token, torrentId, true);
         if (info && info.status === 'downloaded') {
-            // Mark as known-cached for future requests (also done by mergeResults when
-            // called through checkViaAddFallback, but needed here for the standalone export path)
             markHashCached(hash);
             return { torrentId, info };
         }
@@ -273,6 +280,10 @@ async function checkCacheViaAdd(token, hash) {
         await deleteTorrent(token, torrentId).catch(() => {});
         return null;
     } catch (err) {
+        if (err.message && err.message.includes('rate limit')) {
+            if (torrentId) await deleteTorrent(token, torrentId).catch(() => {});
+            return 'rate_limited';
+        }
         console.error(`[rd] checkCacheViaAdd failed for ${hash}:`, err.message);
         if (torrentId) await deleteTorrent(token, torrentId).catch(() => {});
         return null;
