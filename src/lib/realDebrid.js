@@ -150,25 +150,9 @@ async function checkInstantAvailability(token, hashes) {
 
     if (toQuery.length === 0) return result;
 
-    // Step 2: Check via RD's native /torrents/instantAvailability endpoint
-    try {
-        const rdApiResult = await checkViaRdApi(token, toQuery);
-        for (const [hash, val] of Object.entries(rdApiResult)) {
-            result[hash] = val;
-            if (val && val.rd && val.rd.length > 0) {
-                markHashCached(hash);
-            }
-        }
-        const cached = Object.values(rdApiResult).filter(v => v && v.rd && v.rd.length > 0).length;
-        console.log(`[rd] RD API: found ${cached} cached hash(es) out of ${toQuery.length}`);
-        return result;
-    } catch (err) {
-        console.error('[rd] RD API instant availability check failed:', err.message);
-    }
-
-    // Step 3: Fallback — add-magnet check (slow, limited to 10 hashes)
+    // Step 2: Check cache by adding magnets to RD (limited to 10 hashes)
     const limitedHashes = toQuery.slice(0, 10);
-    console.log(`[rd] Trying add-magnet fallback for ${limitedHashes.length} hash(es)...`);
+    console.log(`[rd] Checking ${limitedHashes.length} hash(es) via add-magnet...`);
     try {
         const addResult = await checkViaAddFallback(token, limitedHashes);
         for (const [hash, val] of Object.entries(addResult)) {
@@ -178,36 +162,9 @@ async function checkInstantAvailability(token, hashes) {
             }
         }
         const cached = Object.values(addResult).filter(v => v && v.rd && v.rd.length > 0).length;
-        console.log(`[rd] Add-magnet fallback: found ${cached} cached hash(es)`);
+        console.log(`[rd] Found ${cached} cached hash(es) out of ${limitedHashes.length}`);
     } catch (err) {
-        console.error('[rd] Add-magnet fallback failed:', err.message);
-    }
-
-    return result;
-}
-
-// Primary cache check: RD's native /torrents/instantAvailability endpoint.
-// Batches hashes in groups of 50 to stay within URL length limits.
-async function checkViaRdApi(token, hashes) {
-    const result = {};
-    const BATCH_SIZE = 50;
-
-    for (let i = 0; i < hashes.length; i += BATCH_SIZE) {
-        const batch = hashes.slice(i, i + BATCH_SIZE);
-        const hashPath = batch.map(h => h.toLowerCase()).join('/');
-        const endpoint = `/torrents/instantAvailability/${hashPath}`;
-
-        const data = await apiRequest(endpoint, token);
-        if (!data || typeof data !== 'object') continue;
-
-        for (const [hash, info] of Object.entries(data)) {
-            const lowerHash = hash.toLowerCase();
-            // RD returns { "hash": { "rd": [{ "fileId": { filename, filesize } }, ...] } }
-            // or an empty object / empty rd array if not cached
-            if (info && info.rd && Array.isArray(info.rd) && info.rd.length > 0) {
-                result[lowerHash] = { rd: info.rd };
-            }
-        }
+        console.error('[rd] Add-magnet cache check failed:', err.message);
     }
 
     return result;
