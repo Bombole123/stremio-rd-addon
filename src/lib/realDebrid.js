@@ -142,7 +142,6 @@ async function checkInstantAvailability(token, hashes) {
     const toQuery = [];
     for (const hash of hashes) {
         if (isHashKnownCached(hash)) {
-            // Return a synthetic availability entry so the stream handler sees it as cached
             result[hash] = { rd: [{ 1: { filename: 'cached', filesize: 0 } }] };
         } else {
             toQuery.push(hash);
@@ -151,77 +150,100 @@ async function checkInstantAvailability(token, hashes) {
 
     if (toQuery.length === 0) return result;
 
-    // Step 2: Try StremThru cache check API
+    // Step 2: Check via RD's native /torrents/instantAvailability endpoint
     try {
-        const stremThruResult = await checkViaStremThru(token, toQuery);
-        for (const [hash, val] of Object.entries(stremThruResult)) {
+        const rdApiResult = await checkViaRdApi(token, toQuery);
+        for (const [hash, val] of Object.entries(rdApiResult)) {
             result[hash] = val;
-            // If StremThru says it's cached, remember that locally
             if (val && val.rd && val.rd.length > 0) {
                 markHashCached(hash);
             }
         }
+        const cached = Object.values(rdApiResult).filter(v => v && v.rd && v.rd.length > 0).length;
+        console.log(`[rd] RD API: found ${cached} cached hash(es) out of ${toQuery.length}`);
+        return result;
     } catch (err) {
-        console.error('[rd] StremThru cache check failed:', err.message);
-        // Graceful fallback — return whatever we have (local cache hits)
+        console.error('[rd] RD API instant availability check failed:', err.message);
+    }
+
+    // Step 3: Fallback — add-magnet check (slow, limited to 15 hashes)
+    const limitedHashes = toQuery.slice(0, 15);
+    console.log(`[rd] Trying add-magnet fallback for ${limitedHashes.length} hash(es)...`);
+    try {
+        const addResult = await checkViaAddFallback(token, limitedHashes);
+        for (const [hash, val] of Object.entries(addResult)) {
+            result[hash] = val;
+            if (val && val.rd && val.rd.length > 0) {
+                markHashCached(hash);
+            }
+        }
+        const cached = Object.values(addResult).filter(v => v && v.rd && v.rd.length > 0).length;
+        console.log(`[rd] Add-magnet fallback: found ${cached} cached hash(es)`);
+    } catch (err) {
+        console.error('[rd] Add-magnet fallback failed:', err.message);
     }
 
     return result;
 }
 
-async function checkViaStremThru(token, hashes) {
+// Primary cache check: RD's native /torrents/instantAvailability endpoint.
+// Batches hashes in groups of 50 to stay within URL length limits.
+async function checkViaRdApi(token, hashes) {
     const result = {};
+    const BATCH_SIZE = 50;
 
-    // StremThru supports up to 500 hashes per request
-    for (let i = 0; i < hashes.length; i += 500) {
-        const batch = hashes.slice(i, i + 500);
-        const params = batch.map((h) => `magnet=${encodeURIComponent(`magnet:?xt=urn:btih:${h}`)}`).join('&');
-        const url = `https://stremthru.elfhosted.com/v0/store/magnets/check?${params}`;
+    for (let i = 0; i < hashes.length; i += BATCH_SIZE) {
+        const batch = hashes.slice(i, i + BATCH_SIZE);
+        const hashPath = batch.map(h => h.toLowerCase()).join('/');
+        const endpoint = `/torrents/instantAvailability/${hashPath}`;
 
-        const res = await fetch(url, {
-            method: 'GET',
-            headers: {
-                'X-StremThru-Store-Name': 'realdebrid',
-                'X-StremThru-Store-Authorization': `Bearer ${token}`,
-                'User-Agent': 'stremio-rd-addon',
-            },
-            signal: AbortSignal.timeout(15000),
-        });
+        const data = await apiRequest(endpoint, token);
+        if (!data || typeof data !== 'object') continue;
 
-        if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`StremThru API error ${res.status}: ${text}`);
-        }
-
-        const data = await res.json();
-        if (data && data.data && data.data.items) {
-            for (const item of data.data.items) {
-                const hash = item.hash ? item.hash.toLowerCase() : null;
-                if (!hash) continue;
-
-                if (item.status === 'cached') {
-                    // Map files into the format availability[hash].rd expects:
-                    // An array with one variant object where keys are file IDs and
-                    // values are { filename, filesize }
-                    const variant = {};
-                    if (item.files && item.files.length > 0) {
-                        for (let j = 0; j < item.files.length; j++) {
-                            const f = item.files[j];
-                            const fileId = f.index != null ? f.index + 1 : j + 1;
-                            variant[fileId] = {
-                                filename: f.name || `file_${fileId}`,
-                                filesize: f.size || 0,
-                            };
-                        }
-                    } else {
-                        // No file info but confirmed cached — add a placeholder
-                        variant[1] = { filename: 'cached', filesize: 0 };
-                    }
-                    result[hash] = { rd: [variant] };
-                }
-                // Non-cached hashes are simply omitted from result
+        for (const [hash, info] of Object.entries(data)) {
+            const lowerHash = hash.toLowerCase();
+            // RD returns { "hash": { "rd": [{ "fileId": { filename, filesize } }, ...] } }
+            // or an empty object / empty rd array if not cached
+            if (info && info.rd && Array.isArray(info.rd) && info.rd.length > 0) {
+                result[lowerHash] = { rd: info.rd };
             }
         }
+    }
+
+    return result;
+}
+
+// Fallback: Check cache by adding magnets one-by-one (slow but reliable).
+// Limited to a small batch to avoid rate-limiting. Uses Promise.allSettled for
+// concurrent execution so one failure doesn't block the rest.
+async function checkViaAddFallback(token, hashes) {
+    const result = {};
+
+    const settled = await Promise.allSettled(
+        hashes.map(hash => checkCacheViaAdd(token, hash))
+    );
+
+    for (let i = 0; i < hashes.length; i++) {
+        const outcome = settled[i];
+        const hash = hashes[i].toLowerCase();
+
+        if (outcome.status !== 'fulfilled' || !outcome.value) continue;
+
+        const { info } = outcome.value;
+        // Build availability map from the torrent's file list
+        const variant = {};
+        if (info && info.files && info.files.length > 0) {
+            for (const file of info.files) {
+                const fileId = file.id || 1;
+                variant[fileId] = {
+                    filename: file.path ? file.path.replace(/^\//, '') : `file_${fileId}`,
+                    filesize: file.bytes || 0,
+                };
+            }
+        } else {
+            variant[1] = { filename: 'cached', filesize: 0 };
+        }
+        result[hash] = { rd: [variant] };
     }
 
     return result;
@@ -241,9 +263,10 @@ async function checkCacheViaAdd(token, hash) {
 
         const info = await getTorrentInfo(token, torrentId, true);
         if (info && info.status === 'downloaded') {
-            // Mark as known-cached for future requests
+            // Mark as known-cached for future requests (also done by mergeResults when
+            // called through checkViaAddFallback, but needed here for the standalone export path)
             markHashCached(hash);
-            return { torrentId, info, isNewlyAdded: true };
+            return { torrentId, info };
         }
 
         // Not cached — clean up
