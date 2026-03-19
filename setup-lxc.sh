@@ -115,10 +115,9 @@ apt-get install -y -qq nodejs > /dev/null 2>&1
 useradd -r -s /usr/sbin/nologin -d "$APP_DIR" stremio
 mkdir -p "$APP_DIR"
 
-# Clone the addon
-git clone --depth 1 '"$REPO_URL"' "$APP_DIR" 2>/dev/null
+# Clone the addon (keep .git for easy updates via git pull)
+git clone '"$REPO_URL"' "$APP_DIR" 2>/dev/null
 cd "$APP_DIR"
-rm -rf .git .gitignore
 
 # Install npm dependencies
 npm install --omit=dev --quiet 2>&1
@@ -201,6 +200,9 @@ if [ "$SERVICE_OK" = "active" ]; then
     echo "    pct enter ${CTID}                           (shell into container)"
     echo "    pct exec ${CTID} -- journalctl -u stremio-addon -f  (live logs)"
     echo "    pct exec ${CTID} -- systemctl restart stremio-addon (restart)"
+    echo ""
+    echo "  Update:"
+    echo "    pct exec ${CTID} -- bash -c 'cd /opt/stremio-addon && git pull && systemctl restart stremio-addon'"
     echo ""
     echo "  Next steps:"
     echo "    1. Point Cloudflare tunnel to ${CT_IP}:7000"
