@@ -41,11 +41,81 @@ CTID=200 CT_RAM=1024 CT_DISK=8 bash -c "$(wget -qLO - https://raw.githubusercont
 
 ## Setup
 
-After installation:
+### 1. Set up a Cloudflare Tunnel
 
-1. Point a Cloudflare tunnel (or reverse proxy) to `<container-ip>:7000`
-2. Open `http://<container-ip>:7000/configure` to add your Real-Debrid API token
-3. Click "Install in Stremio" on the configure page
+The addon needs a public HTTPS URL so Stremio can reach it from any device. Cloudflare Tunnel does this for free without opening ports on your network.
+
+**a) Create a Cloudflare account and add your domain**
+
+- Sign up at [dash.cloudflare.com](https://dash.cloudflare.com)
+- Add your domain and update your registrar's nameservers to Cloudflare's (shown during setup)
+
+**b) Install `cloudflared` on the Proxmox host**
+
+```bash
+wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+dpkg -i cloudflared-linux-amd64.deb
+```
+
+**c) Authenticate with Cloudflare**
+
+```bash
+cloudflared tunnel login
+```
+
+This opens a browser. Select your domain to authorize.
+
+**d) Create the tunnel**
+
+```bash
+cloudflared tunnel create stremio-addon
+```
+
+Note the **Tunnel ID** from the output.
+
+**e) Create the config file**
+
+```bash
+mkdir -p /etc/cloudflared
+cat > /etc/cloudflared/config.yml <<EOF
+tunnel: <TUNNEL_ID>
+credentials-file: /root/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: stremio.yourdomain.com
+    service: http://<CONTAINER_IP>:7000
+  - service: http_status:404
+EOF
+```
+
+Replace `<TUNNEL_ID>`, `<CONTAINER_IP>` (your LXC IP), and `stremio.yourdomain.com` with your actual values.
+
+**f) Create the DNS record**
+
+```bash
+cloudflared tunnel route dns stremio-addon stremio.yourdomain.com
+```
+
+**g) Install as a service and start**
+
+```bash
+cloudflared service install
+systemctl start cloudflared
+systemctl enable cloudflared
+```
+
+Your addon is now accessible at `https://stremio.yourdomain.com`.
+
+### 2. Configure the addon
+
+- Open `https://stremio.yourdomain.com/configure`
+- Add your Real-Debrid API token (or use the OAuth login)
+- Set your tunnel URL in the config if it wasn't auto-detected
+
+### 3. Install in Stremio
+
+- On the configure page, click **"Install in Stremio"**
+- Or manually add the manifest URL in Stremio: `https://stremio.yourdomain.com/manifest.json`
 
 ## Updating
 
