@@ -11,7 +11,71 @@ function tokenKey(token) {
     return token.slice(-8);
 }
 
-async function apiRequest(endpoint, token, options = {}) {
+// --- Token refresh logic ---
+let refreshPromise = null;
+
+async function refreshAccessToken() {
+    const { rdRefreshToken, rdClientId, rdClientSecret } = config;
+    if (!rdRefreshToken || !rdClientId || !rdClientSecret) {
+        throw new Error('Missing refresh credentials — re-authenticate via OAuth');
+    }
+
+    const res = await fetch('https://api.real-debrid.com/oauth/v2/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            client_id: rdClientId,
+            client_secret: rdClientSecret,
+            code: rdRefreshToken,
+            grant_type: 'http://oauth.net/grant_type/device/1.0',
+        }).toString(),
+        signal: AbortSignal.timeout(15000),
+    });
+
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Token refresh HTTP ${res.status}: ${text}`);
+    }
+
+    const data = await res.json();
+
+    // Update in-memory config
+    config.rdApiToken = data.access_token;
+    config.rdRefreshToken = data.refresh_token;
+    config.rdTokenExpiry = Date.now() + (data.expires_in * 1000);
+
+    // Persist to disk
+    config.saveLocalConfig({
+        rdApiToken: data.access_token,
+        rdRefreshToken: data.refresh_token,
+        rdTokenExpiry: config.rdTokenExpiry,
+    });
+
+    return data.access_token;
+}
+
+async function tryRefreshToken() {
+    // If a refresh is already in flight, piggy-back on it
+    if (refreshPromise) return refreshPromise;
+
+    refreshPromise = refreshAccessToken()
+        .then((newToken) => {
+            console.log('[auth] Access token refreshed successfully');
+            refreshPromise = null;
+            return newToken;
+        })
+        .catch((err) => {
+            console.error('[auth] Token refresh failed:', err.message);
+            refreshPromise = null;
+            throw err;
+        });
+
+    return refreshPromise;
+}
+
+// --- Core API request with automatic 401 retry ---
+
+async function doFetch(endpoint, token, options = {}) {
     const url = `${config.rdApiBase}${endpoint}`;
     const headers = {
         'Authorization': `Bearer ${token}`,
@@ -27,20 +91,46 @@ async function apiRequest(endpoint, token, options = {}) {
         fetchOptions.body = new URLSearchParams(options.body).toString();
     }
 
-    const res = await fetch(url, {
+    return fetch(url, {
         ...fetchOptions,
         signal: AbortSignal.timeout(15000),
     });
+}
 
-    if (res.status === 401) {
-        throw new Error('Invalid or expired Real-Debrid API token');
-    }
+function handleNonAuthErrors(res) {
     if (res.status === 403) {
         throw new Error('Forbidden/disabled endpoint');
     }
     if (res.status === 429) {
         throw new Error('Real-Debrid rate limit exceeded. Try again shortly.');
     }
+    if (!res.ok) {
+        // Caller will read the body
+        return false;
+    }
+    return true;
+}
+
+async function apiRequest(endpoint, token, options = {}) {
+    let res = await doFetch(endpoint, token, options);
+
+    // On 401, attempt a transparent token refresh and retry once
+    if (res.status === 401) {
+        try {
+            const newToken = await tryRefreshToken();
+            res = await doFetch(endpoint, newToken, options);
+        } catch (_refreshErr) {
+            // Refresh failed — throw the original 401 error
+            throw new Error('Invalid or expired Real-Debrid API token');
+        }
+    }
+
+    if (res.status === 401) {
+        throw new Error('Invalid or expired Real-Debrid API token');
+    }
+
+    handleNonAuthErrors(res);
+
     if (!res.ok) {
         const text = await res.text();
         throw new Error(`RD API error ${res.status}: ${text}`);

@@ -732,10 +732,20 @@ app.get('/api/auth/poll', async (req, res) => {
         const accessToken = tokenData.access_token;
         pendingDeviceCode = null;
 
-        // Step 3: Verify token and save
+        // Step 3: Verify token and save (including refresh credentials)
         const user = await rd.getUser(accessToken);
         config.rdApiToken = accessToken;
-        config.saveLocalConfig({ rdApiToken: accessToken });
+        config.rdRefreshToken = tokenData.refresh_token;
+        config.rdClientId = credentials.client_id;
+        config.rdClientSecret = credentials.client_secret;
+        config.rdTokenExpiry = Date.now() + (tokenData.expires_in * 1000);
+        config.saveLocalConfig({
+            rdApiToken: accessToken,
+            rdRefreshToken: tokenData.refresh_token,
+            rdClientId: credentials.client_id,
+            rdClientSecret: credentials.client_secret,
+            rdTokenExpiry: config.rdTokenExpiry,
+        });
         remountStaticRoutes();
         console.log(`[auth] OAuth login successful for user: ${user.username}`);
 
