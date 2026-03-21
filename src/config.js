@@ -59,6 +59,9 @@ module.exports = {
         rdMaxRetries: 3,             // max retries on 429/5xx
         magnetCheckDelay: 300,       // ms — delay between add-magnet cache checks
         magnetCheckLimit: 10,        // max hashes for add-magnet fallback
+        magnetConcurrency: 3,        // parallel add-magnet checks at once
+        maxPerTierCheck: 3,          // max hashes to check per quality tier
+        minResultsPerTier: 2,        // stop early once we have this many per tier
         zileanSeedBoost: 50,         // synthetic seed count for Zilean results
     },
     localConfigPath: LOCAL_CONFIG_PATH,

@@ -1,10 +1,11 @@
 const config = require('../config');
 const Cache = require('./cache');
 const userStore = require('./userStore');
+const { getCachedAvailability, setCachedAvailability } = require('./torrentDb');
 
 const cache = new Cache();
 
-// Persistent-ish local cache of hashes known to be cached on RD (6-hour TTL)
+// In-memory negative cache of hashes known NOT to be cached on RD (6-hour TTL)
 const hashCache = new Cache();
 
 // Use last 8 chars of token as cache key fingerprint
@@ -276,76 +277,111 @@ function isHashKnownNotCached(hash) {
     return hashCache.get(`notcached:${hash.toLowerCase()}`) === true;
 }
 
-async function checkInstantAvailability(token, hashes) {
+// Group hashes by quality tier using torrent metadata, then pick up to maxPerTier from each
+function prioritizeByQuality(hashes, torrentMap) {
+    const maxPerTier = config.thresholds?.maxPerTierCheck || 3;
+    const tiers = { '2160p': [], '1080p': [], '720p': [], '480p': [], 'unknown': [] };
+
+    for (const hash of hashes) {
+        const torrent = torrentMap && torrentMap.get(hash);
+        const quality = torrent?._parsedQuality || 'unknown';
+        const bucket = tiers[quality] || tiers['unknown'];
+        bucket.push(hash);
+    }
+
+    const selected = [];
+    for (const tier of ['2160p', '1080p', '720p', '480p', 'unknown']) {
+        selected.push(...tiers[tier].slice(0, maxPerTier));
+    }
+    return selected;
+}
+
+// Simple concurrency limiter — runs async tasks with at most `limit` in flight
+async function parallelLimit(tasks, limit) {
+    let idx = 0;
+
+    async function worker() {
+        while (idx < tasks.length) {
+            await tasks[idx++]();
+        }
+    }
+
+    const workers = [];
+    for (let w = 0; w < Math.min(limit, tasks.length); w++) {
+        workers.push(worker());
+    }
+    await Promise.all(workers);
+}
+
+async function checkInstantAvailability(token, hashes, torrentMap) {
     if (!hashes || hashes.length === 0) return {};
 
-    const result = {};
+    // Normalize all hashes to lowercase once so all downstream keying is consistent
+    const normalizedHashes = hashes.map(h => h.toLowerCase());
 
-    // Step 1: Check local hash cache first — remove already-known hashes
+    const result = {};
+    const concurrency = config.thresholds?.magnetConcurrency || 3;
+    const minPerTier = config.thresholds?.minResultsPerTier || 2;
+
+    // Step 1: Check persistent positive cache (SQLite) and in-memory negative cache
     const toQuery = [];
-    let skippedCount = 0;
-    for (const hash of hashes) {
-        if (isHashKnownCached(hash)) {
-            result[hash] = { rd: [{ 1: { filename: 'cached', filesize: 0 } }] };
+    let positiveCacheHits = 0;
+    let negativeCacheHits = 0;
+
+    for (const hash of normalizedHashes) {
+        const cached = getCachedAvailability(hash);
+        if (cached) {
+            result[hash] = cached;
+            markHashCached(hash);
+            positiveCacheHits++;
         } else if (isHashKnownNotCached(hash)) {
-            skippedCount++;
+            negativeCacheHits++;
         } else {
             toQuery.push(hash);
         }
     }
-    if (skippedCount > 0) {
-        console.log(`[rd] Skipped ${skippedCount} known-not-cached hash(es)`);
+
+    if (positiveCacheHits > 0 || negativeCacheHits > 0) {
+        console.log(`[rd] Cache: ${positiveCacheHits} positive hit(s), ${negativeCacheHits} negative skip(s)`);
     }
 
     if (toQuery.length === 0) return result;
 
-    // Step 2: Check cache by adding magnets to RD
+    // Step 2: Prioritize hashes by quality tier
+    const prioritized = torrentMap ? prioritizeByQuality(toQuery, torrentMap) : toQuery;
     const magnetLimit = config.thresholds?.magnetCheckLimit || 10;
-    const limitedHashes = toQuery.slice(0, magnetLimit);
-    console.log(`[rd] Checking ${limitedHashes.length} hash(es) via add-magnet...`);
-    try {
-        const addResult = await checkViaAddFallback(token, limitedHashes);
-        for (const [hash, val] of Object.entries(addResult)) {
-            result[hash] = val;
-            if (val && val.rd && val.rd.length > 0) {
-                markHashCached(hash);
-            }
-        }
-        const cached = Object.values(addResult).filter(v => v && v.rd && v.rd.length > 0).length;
-        console.log(`[rd] Found ${cached} cached hash(es) out of ${limitedHashes.length}`);
-    } catch (err) {
-        console.error('[rd] Add-magnet cache check failed:', err.message);
-    }
+    const limitedHashes = prioritized.slice(0, magnetLimit);
 
-    return result;
-}
+    console.log(`[rd] Checking ${limitedHashes.length} hash(es) via parallel add-magnet (concurrency=${concurrency})...`);
 
-// Fallback: Check cache by adding magnets sequentially with a delay to avoid
-// rate-limiting. Stops early after 2 consecutive rate-limit errors.
-async function checkViaAddFallback(token, hashes) {
-    const result = {};
-    let consecutiveRateLimits = 0;
+    // Step 3: Check in parallel with concurrency limit + early termination
+    const tierCounts = {};
+    let rateLimitCount = 0;
+    let checkedCount = 0;
+    let stopped = false;
 
-    for (const rawHash of hashes) {
-        if (consecutiveRateLimits >= 2) {
-            console.log('[rd] Stopping add-magnet fallback — rate limited');
-            break;
-        }
+    const tasks = limitedHashes.map((hash) => async () => {
+        // Early termination: stop if we already have enough results
+        if (stopped) return;
 
-        const hash = rawHash.toLowerCase();
         const cacheResult = await checkCacheViaAdd(token, hash);
+        checkedCount++;
 
         if (cacheResult === 'rate_limited') {
-            consecutiveRateLimits++;
-            continue;
+            rateLimitCount++;
+            if (rateLimitCount >= 2) {
+                console.log('[rd] Stopping — rate limited');
+                stopped = true;
+            }
+            return;
         }
-        consecutiveRateLimits = 0;
 
         if (!cacheResult) {
-            markHashNotCached(rawHash);
-            continue;
+            markHashNotCached(hash);
+            return;
         }
 
+        // Build availability object from torrent info
         const { info } = cacheResult;
         const variant = {};
         if (info && info.files && info.files.length > 0) {
@@ -359,11 +395,39 @@ async function checkViaAddFallback(token, hashes) {
         } else {
             variant[1] = { filename: 'cached', filesize: 0 };
         }
-        result[hash] = { rd: [variant] };
 
-        // Small delay between requests to stay under rate limits
-        await new Promise(r => setTimeout(r, config.thresholds?.magnetCheckDelay || 300));
-    }
+        const availability = { rd: [variant] };
+        result[hash] = availability;
+        markHashCached(hash);
+        setCachedAvailability(hash, availability);
+
+        // Track per-tier results for early termination
+        const torrent = torrentMap && torrentMap.get(hash);
+        const quality = torrent?._parsedQuality || 'unknown';
+        tierCounts[quality] = (tierCounts[quality] || 0) + 1;
+
+        // Check if every tier with candidates has enough results
+        if (torrentMap) {
+            const enabledQualities = config.settings?.qualities || ['2160p', '1080p', '720p', '480p'];
+            const allSatisfied = enabledQualities.every(q => {
+                const hasCandidates = limitedHashes.some(h => {
+                    const t = torrentMap.get(h);
+                    return t && t._parsedQuality === q;
+                });
+                if (!hasCandidates) return true;
+                return (tierCounts[q] || 0) >= minPerTier;
+            });
+            if (allSatisfied) {
+                console.log(`[rd] Early termination — enough results per tier after ${checkedCount} checks`);
+                stopped = true;
+            }
+        }
+    });
+
+    await parallelLimit(tasks, concurrency);
+
+    const cachedCount = Object.values(result).filter(v => v && v.rd && v.rd.length > 0).length;
+    console.log(`[rd] Found ${cachedCount - positiveCacheHits} new cached hash(es) out of ${checkedCount} checked (${positiveCacheHits} from cache)`);
 
     return result;
 }

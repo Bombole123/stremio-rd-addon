@@ -181,14 +181,20 @@ async function streamHandler(type, id, options = {}) {
         return (b.size || 0) - (a.size || 0);
     });
 
+    // Build torrent map with parsed quality for prioritized cache checking
+    const torrentMap = new Map();
+    for (const t of uniqueTorrents) {
+        const parsed = parse(t.title);
+        torrentMap.set(t.hash, { ...t, _parsedQuality: parsed.quality || 'unknown' });
+    }
+
     const hashes = uniqueTorrents.map((t) => t.hash);
     console.log(`[stream] Checking ${hashes.length} hashes against RD cache`);
 
-    // Step 3: Check which hashes are cached
+    // Step 3: Check which hashes are cached (parallel + prioritized + early termination)
     const cacheStart = Date.now();
-    const availability = await rd.checkInstantAvailability(rdToken, hashes);
+    const availability = await rd.checkInstantAvailability(rdToken, hashes, torrentMap);
     const cacheMs = Date.now() - cacheStart;
-    const torrentMap = new Map(uniqueTorrents.map((t) => [t.hash, t]));
     const streams = [];
 
     for (const hash of hashes) {
