@@ -266,6 +266,16 @@ function isHashKnownCached(hash) {
     return hashCache.get(`known:${hash.toLowerCase()}`) === true;
 }
 
+// Mark a hash as known NOT cached on RD (6-hour TTL)
+function markHashNotCached(hash) {
+    hashCache.set(`notcached:${hash.toLowerCase()}`, true, config.cacheTTL.hashCache);
+}
+
+// Check if a hash is known to NOT be cached on RD
+function isHashKnownNotCached(hash) {
+    return hashCache.get(`notcached:${hash.toLowerCase()}`) === true;
+}
+
 async function checkInstantAvailability(token, hashes) {
     if (!hashes || hashes.length === 0) return {};
 
@@ -273,12 +283,18 @@ async function checkInstantAvailability(token, hashes) {
 
     // Step 1: Check local hash cache first — remove already-known hashes
     const toQuery = [];
+    let skippedCount = 0;
     for (const hash of hashes) {
         if (isHashKnownCached(hash)) {
             result[hash] = { rd: [{ 1: { filename: 'cached', filesize: 0 } }] };
+        } else if (isHashKnownNotCached(hash)) {
+            skippedCount++;
         } else {
             toQuery.push(hash);
         }
+    }
+    if (skippedCount > 0) {
+        console.log(`[rd] Skipped ${skippedCount} known-not-cached hash(es)`);
     }
 
     if (toQuery.length === 0) return result;
@@ -325,7 +341,10 @@ async function checkViaAddFallback(token, hashes) {
         }
         consecutiveRateLimits = 0;
 
-        if (!cacheResult) continue;
+        if (!cacheResult) {
+            markHashNotCached(rawHash);
+            continue;
+        }
 
         const { info } = cacheResult;
         const variant = {};
@@ -419,4 +438,6 @@ module.exports = {
     deleteTorrent,
     clearCache,
     markHashCached,
+    markHashNotCached,
+    isHashKnownNotCached,
 };

@@ -172,6 +172,15 @@ async function streamHandler(type, id, options = {}) {
     const uniqueTorrents = [...deduped.values()];
     console.log(`[stream] ${torrents.length} torrents deduplicated to ${uniqueTorrents.length}`);
 
+    // Sort torrents by likelihood of being cached on RD before hash extraction
+    uniqueTorrents.sort((a, b) => {
+        // Highest seeds first
+        const seedDiff = (b.seeds || 0) - (a.seeds || 0);
+        if (seedDiff !== 0) return seedDiff;
+        // Then by size descending
+        return (b.size || 0) - (a.size || 0);
+    });
+
     const hashes = uniqueTorrents.map((t) => t.hash);
     console.log(`[stream] Checking ${hashes.length} hashes against RD cache`);
 
