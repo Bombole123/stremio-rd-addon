@@ -34,7 +34,7 @@ const pendingResolves = new Map();
 // Cache resolved download URLs — avoids re-unrestricting on repeated requests from same playback
 // Key: resolveKey, Value: { url, expiry }
 const resolvedUrlCache = new Map();
-const RESOLVE_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+const RESOLVE_CACHE_TTL = 20 * 60 * 1000; // 20 minutes — RD links expire after ~30-60 min
 
 // Clean up expired entries every 30 minutes
 setInterval(() => {
@@ -232,12 +232,13 @@ async function handleResolve(req, res) {
         }
 
         // 302 redirect — player connects directly to RD CDN
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.redirect(302, downloadUrl);
     } catch (err) {
         if (err.name === 'AbortError') return;
         console.error(`[resolve] Error:`, err.cause ? `${err.message} - ${err.cause.message}` : err.message);
         if (!res.headersSent) {
-            res.status(502).send(`Resolve failed: ${err.message}`);
+            res.status(502).json({ error: err.message });
         }
     }
 }
@@ -268,6 +269,7 @@ async function handleResolveHead(req, res) {
             resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
         }
 
+        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.redirect(302, downloadUrl);
     } catch (err) {
         if (!res.headersSent) res.status(502).end();

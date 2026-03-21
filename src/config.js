@@ -48,7 +48,7 @@ module.exports = {
     cacheTTL: {
         torrentList: 2 * 60 * 1000,   // 2 minutes
         torrentInfo: 5 * 60 * 1000,   // 5 minutes
-        unrestrict: 30 * 60 * 1000,   // 30 minutes
+        unrestrict: 15 * 60 * 1000,   // 15 minutes — RD CDN links expire after ~30-60 min
         hashCache: 6 * 60 * 60 * 1000, // 6 hours — known-cached hashes
     },
     thresholds: {
