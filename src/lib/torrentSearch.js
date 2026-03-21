@@ -8,6 +8,38 @@ const CACHE_TTL = 30 * 60 * 1000; // 30 minutes — in-memory cache for dedup wi
 
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// --- Source reliability tracking ---
+const sourceStats = {};
+
+function recordSourceResult(name, success, resultCount, durationMs) {
+    if (!sourceStats[name]) {
+        sourceStats[name] = { successes: 0, failures: 0, totalResults: 0, totalMs: 0, consecutiveFailures: 0 };
+    }
+    const s = sourceStats[name];
+    s.totalMs += durationMs;
+    if (success) {
+        s.successes++;
+        s.totalResults += resultCount;
+        s.consecutiveFailures = 0;
+    } else {
+        s.failures++;
+        s.consecutiveFailures++;
+    }
+}
+
+function isSourceDisabled(name) {
+    const s = sourceStats[name];
+    if (!s) return false;
+    return s.consecutiveFailures >= 5;
+}
+
+// Re-enable all sources every 10 minutes so they get retried
+setInterval(() => {
+    for (const s of Object.values(sourceStats)) {
+        s.consecutiveFailures = 0;
+    }
+}, 10 * 60 * 1000).unref();
+
 function normalizeTitle(title) {
     return title.toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -335,8 +367,6 @@ function filterByTitle(torrents, title, year, type) {
 
 // Live search — queries all sources in parallel
 async function liveSearch(imdbId, type, title, year, season, episode) {
-    const searches = [];
-
     // Build search query
     let query = title;
     if (type === 'movie' && year) {
@@ -347,29 +377,52 @@ async function liveSearch(imdbId, type, title, year, season, episode) {
         query = `${title} ${se}${ep}`;
     }
 
-    // Always search these
-    searches.push(searchTPB(query));
-    searches.push(searchKnaben(query));
-    searches.push(searchTorrentsCSV(query));
-    searches.push(searchZilean(imdbId));
+    // Define all sources with names for reliability tracking
+    const sources = [
+        { name: 'TPB', fn: () => searchTPB(query) },
+        { name: 'Knaben', fn: () => searchKnaben(query) },
+        { name: 'CSV', fn: () => searchTorrentsCSV(query) },
+        { name: 'Zilean', fn: () => searchZilean(imdbId, season, episode) },
+    ];
 
-    // Type-specific sources
     if (type === 'series') {
-        searches.push(searchEZTV(imdbId));
+        sources.push({ name: 'EZTV', fn: () => searchEZTV(imdbId) });
     } else {
-        searches.push(searchYTS(imdbId));
-        searches.push(searchTorrentGalaxy(query));
+        sources.push({ name: 'YTS', fn: () => searchYTS(imdbId) });
+        sources.push({ name: 'TGx', fn: () => searchTorrentGalaxy(query) });
     }
 
-    const totalSources = searches.length;
+    // Skip disabled sources, track timing and success/failure for the rest
+    const activeSources = [];
+    for (const src of sources) {
+        if (isSourceDisabled(src.name)) {
+            console.log(`[search] Skipping ${src.name} — disabled after consecutive failures`);
+            continue;
+        }
+        activeSources.push(src);
+    }
+
+    const totalSources = activeSources.length;
     const startTime = Date.now();
 
-    // Wrap each search so we can collect partial results on timeout.
-    // Each wrapper resolves with the search result (or [] on error) and stores it immediately.
+    // Wrap each search so we can collect partial results on timeout
+    // and record reliability stats per source.
     const results = new Array(totalSources).fill(null);
-    const wrapped = searches.map((p, i) =>
-        p.then(v => { results[i] = v; }).catch(() => { results[i] = []; })
-    );
+    const wrapped = activeSources.map((src, i) => {
+        const t0 = Date.now();
+        return src.fn()
+            .then(v => {
+                // Sources catch their own errors and return [] — treat empty results
+                // as failures so sources that are down (timeouts, blocks) get disabled.
+                const ok = Array.isArray(v) && v.length > 0;
+                recordSourceResult(src.name, ok, v.length, Date.now() - t0);
+                results[i] = v;
+            })
+            .catch(() => {
+                recordSourceResult(src.name, false, 0, Date.now() - t0);
+                results[i] = [];
+            });
+    });
 
     let timedOut = false;
     const allDone = Promise.all(wrapped);
@@ -496,4 +549,4 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
     return filtered;
 }
 
-module.exports = { searchTorrents };
+module.exports = { searchTorrents, sourceStats };

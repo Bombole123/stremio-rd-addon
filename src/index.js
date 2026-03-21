@@ -19,6 +19,9 @@ app.use((req, res, next) => {
     next();
 });
 
+// Cached configure page HTML — invalidated when config changes
+let configPageCache = null;
+
 // Single-flight map: deduplicates concurrent resolve requests for the same hash+episode
 const pendingResolves = new Map();
 
@@ -37,6 +40,7 @@ setInterval(() => {
 
 // Core resolve logic — returns the download URL string or throws
 async function resolveHash(rdToken, hash, type, season, episode) {
+    const startTime = Date.now();
     // Check if hash already in user's RD library
     let torrentId = null;
     let weAdded = false; // Track whether we added this magnet ourselves
@@ -121,6 +125,8 @@ async function resolveHash(rdToken, hash, type, season, episode) {
         }
 
         rd.markHashCached(hash);
+        const source = weAdded ? 'added' : 'library';
+        console.log(`[resolve] ${hash} | ${Date.now() - startTime}ms | ${source}`);
         return { url: unrestricted.download, fileSize: targetFile.bytes || 0 };
     } catch (err) {
         // Clean up torrents we added if resolve fails (e.g. episode not found in pack)
@@ -153,10 +159,11 @@ app.get('/resolve/:hash', async (req, res) => {
             fileSize = cached.fileSize || 0;
         } else {
             if (!pendingResolves.has(resolveKey)) {
-                pendingResolves.set(resolveKey, resolveHash(rdToken, hash, type, season, episode));
+                const p = resolveHash(rdToken, hash, type, season, episode);
+                p.finally(() => pendingResolves.delete(resolveKey));
+                pendingResolves.set(resolveKey, p);
             }
             const result = await pendingResolves.get(resolveKey);
-            pendingResolves.delete(resolveKey);
             downloadUrl = result.url;
             fileSize = result.fileSize || 0;
             resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize, expiry: Date.now() + RESOLVE_CACHE_TTL });
@@ -178,7 +185,6 @@ app.get('/resolve/:hash', async (req, res) => {
         // 302 redirect — player connects directly to RD CDN
         res.redirect(302, downloadUrl);
     } catch (err) {
-        pendingResolves.delete(resolveKey);
         if (err.name === 'AbortError') return;
         console.error(`[resolve] Error:`, err.cause ? `${err.message} - ${err.cause.message}` : err.message);
         if (!res.headersSent) {
@@ -204,23 +210,24 @@ app.head('/resolve/:hash', async (req, res) => {
             downloadUrl = cached.url;
         } else {
             if (!pendingResolves.has(resolveKey)) {
-                pendingResolves.set(resolveKey, resolveHash(rdToken, hash, type, season, episode));
+                const p = resolveHash(rdToken, hash, type, season, episode);
+                p.finally(() => pendingResolves.delete(resolveKey));
+                pendingResolves.set(resolveKey, p);
             }
             const result = await pendingResolves.get(resolveKey);
-            pendingResolves.delete(resolveKey);
             downloadUrl = result.url;
             resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
         }
 
         res.redirect(302, downloadUrl);
     } catch (err) {
-        pendingResolves.delete(resolveKey);
         if (!res.headersSent) res.status(502).end();
     }
 });
 
 // Configure page HTML
 function getConfigurePage(savedToken, settings) {
+    if (configPageCache) return configPageCache;
     const hasSavedToken = !!savedToken;
     const maskedToken = hasSavedToken
         ? (savedToken.length > 12 ? savedToken.slice(0, 6) + '...' + savedToken.slice(-6) : '******')
@@ -229,7 +236,7 @@ function getConfigurePage(savedToken, settings) {
     const hostIP = config.hostIP;
     const port = config.port;
     const tunnelUrl = config.tunnelUrl;
-    return `<!DOCTYPE html>
+    const html = `<!DOCTYPE html>
 <html>
 <head>
     <title>Real-Debrid Streams - Configure</title>
@@ -396,7 +403,14 @@ function getConfigurePage(savedToken, settings) {
                 <input type="number" id="maxPerQuality" min="1" max="20" value="${s.maxPerQuality || 5}" />
                 <div class="hint">Max streams per quality tier</div>
             </div>
-            <div></div>
+            <div>
+                <label for="languageFilter">Language Filter</label>
+                <select id="languageFilter">
+                    <option value="all" ${s.languageFilter === 'all' ? 'selected' : ''}>All Languages</option>
+                    <option value="english" ${s.languageFilter === 'english' ? 'selected' : ''}>English Only</option>
+                    <option value="multi" ${s.languageFilter === 'multi' ? 'selected' : ''}>Multi/Dual Audio</option>
+                </select>
+            </div>
         </div>
 
         <div class="settings-row">
@@ -480,6 +494,7 @@ function getConfigurePage(savedToken, settings) {
                 maxPerQuality: parseInt(document.getElementById('maxPerQuality').value, 10) || 5,
                 qualities: qualities,
                 preferredCodec: document.getElementById('preferredCodec').value,
+                languageFilter: document.getElementById('languageFilter').value,
                 maxFileSize: parseFloat(document.getElementById('maxFileSize').value) || 0
             };
         }
@@ -616,6 +631,8 @@ function getConfigurePage(savedToken, settings) {
     </script>
 </body>
 </html>`;
+    configPageCache = html;
+    return html;
 }
 
 // API: Save token and/or settings
@@ -654,6 +671,7 @@ app.post('/api/save-config', async (req, res) => {
             maxPerQuality: Math.min(Math.max(parseInt(settings.maxPerQuality, 10) || 5, 1), 20),
             qualities: (settings.qualities || []).filter(q => validQualities.includes(q)),
             preferredCodec: settings.preferredCodec || 'all',
+            languageFilter: ['all', 'english', 'multi'].includes(settings.languageFilter) ? settings.languageFilter : 'all',
             maxFileSize: Math.max(parseFloat(settings.maxFileSize) || 0, 0),
         };
         if (toSave.settings.qualities.length === 0) {
@@ -664,6 +682,7 @@ app.post('/api/save-config', async (req, res) => {
     }
 
     config.saveLocalConfig(toSave);
+    configPageCache = null;
     res.json({ success: true, username });
 });
 
@@ -757,6 +776,7 @@ app.get('/api/auth/poll', async (req, res) => {
             rdClientSecret: credentials.client_secret,
             rdTokenExpiry: config.rdTokenExpiry,
         });
+        configPageCache = null;
         remountStaticRoutes();
         console.log(`[auth] OAuth login successful for user: ${user.username}`);
 
@@ -802,6 +822,7 @@ app.use('/:rdToken', tokenRouter);
 const staticWrapper = express.Router();
 let staticInner = null;
 function remountStaticRoutes() {
+    configPageCache = null;
     staticInner = null;
     if (config.rdApiToken) {
         staticInner = express.Router();

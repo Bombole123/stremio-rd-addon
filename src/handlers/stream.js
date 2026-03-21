@@ -57,6 +57,7 @@ function buildMultiCriteriaComparator(sortPriority) {
 }
 
 async function streamHandler(type, id) {
+    const startTime = Date.now();
     console.log(`[stream] Request: type=${type} id=${id}`);
 
     const parts = id.split(':');
@@ -70,7 +71,9 @@ async function streamHandler(type, id) {
     }
 
     // Step 1: Resolve IMDB ID to title via Cinemeta
+    const metaStart = Date.now();
     const meta = await getMetaByImdbId(type, imdbId);
+    const metaMs = Date.now() - metaStart;
     if (!meta) {
         console.log(`[stream] Could not resolve IMDB ID: ${imdbId}`);
         return { streams: [] };
@@ -87,7 +90,9 @@ async function streamHandler(type, id) {
     console.log(`[stream] Looking for: "${meta.name}" (${meta.year}) ${label}`);
 
     // Step 2: Search torrent indexers for hashes
+    const searchStart = Date.now();
     const torrents = await searchTorrents(imdbId, type, meta.name, meta.year, season, episode);
+    const searchMs = Date.now() - searchStart;
     if (torrents.length === 0) {
         console.log(`[stream] No torrents found from indexers`);
         return { streams: [] };
@@ -108,7 +113,9 @@ async function streamHandler(type, id) {
     console.log(`[stream] Checking ${hashes.length} hashes against RD cache`);
 
     // Step 3: Check which hashes are cached
+    const cacheStart = Date.now();
     const availability = await rd.checkInstantAvailability(config.rdApiToken, hashes);
+    const cacheMs = Date.now() - cacheStart;
     const torrentMap = new Map(uniqueTorrents.map((t) => [t.hash, t]));
     const streams = [];
 
@@ -174,12 +181,34 @@ async function streamHandler(type, id) {
     });
     if (filtered.length === 0) filtered = streams;
 
+    // Filter by language preference
+    const languageFilter = config.settings.languageFilter || 'all';
+    if (languageFilter !== 'all') {
+        const beforeLang = filtered.length;
+        const langFiltered = filtered.filter((s) => {
+            const langs = s._language;
+            if (!langs || (Array.isArray(langs) && langs.length === 0)) return true; // keep unknown
+            const langArr = Array.isArray(langs) ? langs : [langs];
+            const lower = langArr.map(l => l.toLowerCase());
+            if (languageFilter === 'english') {
+                return lower.some(l => l === 'english' || l === 'eng' || l === 'en');
+            }
+            if (languageFilter === 'multi') {
+                return lower.includes('multi') || langArr.length > 1;
+            }
+            return lower.some(l => l === languageFilter.toLowerCase());
+        });
+        if (langFiltered.length > 0) filtered = langFiltered;
+        console.log(`[stream] Language filter: ${beforeLang - filtered.length} streams removed`);
+    }
+
     // Filter by codec preference
     if (preferredCodec && preferredCodec !== 'all') {
         const codecFiltered = filtered.filter((s) => {
-            const desc = (s.description || '').toLowerCase();
-            if (preferredCodec === 'x265') return desc.includes('x265') || desc.includes('hevc');
-            if (preferredCodec === 'x264') return desc.includes('x264') || desc.includes('avc');
+            if (!s._codec) return true; // keep streams with no detected codec
+            const c = s._codec.toLowerCase();
+            if (preferredCodec === 'x265') return c === 'x265' || c === 'h.265' || c === 'h265' || c === 'hevc';
+            if (preferredCodec === 'x264') return c === 'x264' || c === 'h.264' || c === 'h264' || c === 'avc';
             return true;
         });
         if (codecFiltered.length > 0) filtered = codecFiltered;
@@ -213,6 +242,7 @@ async function streamHandler(type, id) {
     const cleaned = limited.map(({ _quality, _size, _seeds, _codec, _source, _language, ...rest }) => rest);
 
     console.log(`[stream] Returning ${cleaned.length} of ${streams.length} streams`);
+    console.log(`[stream] ${type}/${imdbId} | ${metaMs}ms meta | ${searchMs}ms search (${uniqueTorrents.length} torrents) | ${cacheMs}ms cache | ${streams.length} streams | ${Date.now() - startTime}ms total`);
 
     return { streams: cleaned };
 }

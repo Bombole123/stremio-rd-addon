@@ -29,6 +29,7 @@ const defaultSettings = {
     maxPerQuality: 5,
     qualities: ['2160p', '1080p', '720p', '480p'],
     preferredCodec: 'all',
+    languageFilter: 'all',
     maxFileSize: 0,
 };
 
