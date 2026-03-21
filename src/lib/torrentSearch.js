@@ -412,11 +412,12 @@ async function liveSearch(imdbId, type, title, year, season, episode) {
         const t0 = Date.now();
         return src.fn()
             .then(v => {
-                // Sources catch their own errors and return [] — treat empty results
-                // as failures so sources that are down (timeouts, blocks) get disabled.
-                const ok = Array.isArray(v) && v.length > 0;
-                recordSourceResult(src.name, ok, v.length, Date.now() - t0);
-                results[i] = v;
+                // A well-formed array response (even empty) means the source is reachable
+                // and working — don't penalise it for a title with no results.
+                // Only network errors / non-array responses count as failures.
+                const ok = Array.isArray(v);
+                recordSourceResult(src.name, ok, Array.isArray(v) ? v.length : 0, Date.now() - t0);
+                results[i] = Array.isArray(v) ? v : [];
             })
             .catch(() => {
                 recordSourceResult(src.name, false, 0, Date.now() - t0);

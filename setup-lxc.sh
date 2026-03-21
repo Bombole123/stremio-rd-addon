@@ -178,6 +178,38 @@ systemctl restart systemd-journald
 systemctl daemon-reload
 systemctl enable stremio-addon --quiet
 systemctl start stremio-addon
+
+# The update script is already present from the git clone — just ensure it is executable
+chmod +x "$APP_DIR/scripts/update.sh"
+
+# Create auto-update timer (4am EST / 9am UTC daily)
+cat > /etc/systemd/system/stremio-update.timer <<TEOF
+[Unit]
+Description=Auto-update Stremio addon daily
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+TEOF
+
+cat > /etc/systemd/system/stremio-update.service <<SUEOF
+[Unit]
+Description=Stremio addon auto-update
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/stremio-addon/scripts/update.sh
+User=root
+SUEOF
+
+systemctl daemon-reload
+systemctl enable stremio-update.timer --quiet
+systemctl start stremio-update.timer
 '
 
 # ── 5. Verify ────────────────────────────────────────────────
@@ -201,7 +233,9 @@ if [ "$SERVICE_OK" = "active" ]; then
     echo "    pct exec ${CTID} -- journalctl -u stremio-addon -f  (live logs)"
     echo "    pct exec ${CTID} -- systemctl restart stremio-addon (restart)"
     echo ""
-    echo "  Update:"
+    echo "  Auto-update: daily at 4:00 AM EST (9:00 UTC)"
+    echo ""
+    echo "  Manual update:"
     echo "    pct exec ${CTID} -- bash -c 'cd /opt/stremio-addon && git pull && systemctl restart stremio-addon'"
     echo ""
     echo "  Next steps:"

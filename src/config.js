@@ -43,6 +43,7 @@ module.exports = {
     rdTokenExpiry: localConfig.rdTokenExpiry || null,
     tunnelUrl: process.env.TUNNEL_URL || localConfig.tunnelUrl || 'https://stremio.bombole.org',
     rdApiBase: 'https://api.real-debrid.com/rest/1.0',
+    tmdbApiKey: process.env.TMDB_API_KEY || localConfig.tmdbApiKey || null,
     settings: { ...defaultSettings, ...(localConfig.settings || {}) },
     cacheTTL: {
         torrentList: 2 * 60 * 1000,   // 2 minutes

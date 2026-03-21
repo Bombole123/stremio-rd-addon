@@ -4,14 +4,22 @@ Self-hosted Stremio addon that searches multiple torrent indexers, checks Real-D
 
 ## Features
 
-- Searches multiple torrent sources (TPB, EZTV, YTS, TorrentGalaxy, Knaben, Torrents-CSV, Zilean)
-- Real-Debrid cache checking with local hash caching (6h TTL)
-- Quality filtering (2160p, 1080p, 720p, 480p) with configurable sort priority
-- Codec preference (x265/x264)
-- File size limits
-- Real-Debrid OAuth device code login
-- SQLite torrent database for fast repeat lookups
-- Runs as a systemd service with security hardening
+- **Multi-user support** — each user authenticates via OAuth and gets a unique addon URL; RD tokens are stored server-side, never exposed in URLs
+- **Season pack intelligence** — detects cached season packs on RD and reuses them for all episodes, giving instant playback
+- **Next-episode pre-resolve** — automatically pre-resolves the next episode in the background for seamless binge-watching
+- **7 torrent sources** — TPB, EZTV, YTS, TorrentGalaxy, Knaben, Torrents-CSV, Zilean (with smart source weighting)
+- **Source reliability tracking** — automatically disables failing indexers and re-enables them after 10 minutes
+- **RD API retry with backoff** — handles rate limits gracefully with exponential backoff
+- **Auto-refresh OAuth tokens** — tokens refresh transparently when they expire
+- **Quality filtering** — 2160p, 1080p, 720p, 480p with configurable sort priority
+- **Language filter** — filter streams by English, Multi/Dual Audio, or all languages
+- **Codec preference** — x265/x264 filtering using parsed torrent metadata
+- **TMDB metadata fallback** — falls back to TMDB API when Cinemeta is unavailable
+- **Status dashboard** — `/status` page showing RD account info, source health, and cache stats
+- **Auto-update** — daily updates at 4am EST via systemd timer
+- **Mobile-friendly** — configure page works on phones and tablets
+- **SQLite caching** — torrent database with optimized indexes for fast repeat lookups
+- **Security hardening** — runs as unprivileged systemd service with strict filesystem protections
 
 ## One-Command Install (Proxmox)
 
@@ -108,16 +116,27 @@ Your addon is now accessible at `https://stremio.yourdomain.com`.
 
 ### 2. Configure the addon
 
-- Open `https://stremio.yourdomain.com/configure`
-- Add your Real-Debrid API token (or use the OAuth login)
-- Set your tunnel URL in the config if it wasn't auto-detected
+1. Open `https://stremio.yourdomain.com/configure`
+2. Click **"Login with Real-Debrid"** and authorize on the RD website
+3. After login, you'll see your personal addon URL — click **"Install in Stremio"**
 
-### 3. Install in Stremio
+Each user who authenticates gets their own unique URL. RD tokens are stored securely on the server, never exposed in URLs.
 
-- On the configure page, click **"Install in Stremio"**
-- Or manually add the manifest URL in Stremio: `https://stremio.yourdomain.com/manifest.json`
+### 3. Multi-user setup
+
+Multiple people can use the same addon instance with their own RD accounts:
+
+1. Each person visits `/configure` and authenticates with their RD account
+2. They get a unique addon URL: `https://stremio.yourdomain.com/<user-id>/manifest.json`
+3. Each person's streams resolve through their own RD account independently
+
+The legacy single-user setup (token in `config.local.json`) still works as a fallback.
 
 ## Updating
+
+The addon auto-updates daily at **4:00 AM EST**. Updates won't interrupt active streams since Stremio streams directly from Real-Debrid's CDN.
+
+To update manually:
 
 ```bash
 cd /opt/stremio-addon && git pull && systemctl restart stremio-addon
@@ -128,6 +147,24 @@ Or from the Proxmox host:
 ```bash
 pct exec <CTID> -- bash -c 'cd /opt/stremio-addon && git pull && systemctl restart stremio-addon'
 ```
+
+Check auto-update status:
+
+```bash
+systemctl status stremio-update.timer
+journalctl -t stremio-update --no-pager -n 20
+```
+
+## Status Dashboard
+
+Visit `/status` in a browser to see:
+
+- Addon version and uptime
+- Real-Debrid account info (username, premium expiry)
+- Torrent source health (up/down, response times, success rates)
+- Registered users
+
+Also available as JSON: `curl https://stremio.yourdomain.com/status`
 
 ## Useful Commands
 
@@ -143,6 +180,9 @@ systemctl restart stremio-addon
 
 # Check status
 systemctl status stremio-addon
+
+# Check auto-update timer
+systemctl status stremio-update.timer
 ```
 
 ## Configuration
@@ -152,7 +192,37 @@ All settings are managed through the web UI at `/configure`:
 - **Sort priority** — order of: quality, language, size, seeders, codec, source
 - **Max per quality** — max streams shown per quality tier (default: 5)
 - **Qualities** — enable/disable 2160p, 1080p, 720p, 480p
+- **Language filter** — all languages, English only, or Multi/Dual Audio
 - **Preferred codec** — all, x265, or x264
 - **Max file size** — limit in GB (0 = unlimited)
 
-Config is stored in `/opt/stremio-addon/config.local.json`.
+### Optional: TMDB fallback
+
+If Cinemeta (Stremio's metadata service) goes down, the addon can fall back to TMDB for title lookups. To enable, get a free API key from [themoviedb.org](https://www.themoviedb.org/settings/api) and add it to your config:
+
+```bash
+# Inside the LXC container
+cd /opt/stremio-addon
+node -e "
+  const fs = require('fs');
+  const cfg = JSON.parse(fs.readFileSync('config.local.json'));
+  cfg.tmdbApiKey = 'YOUR_TMDB_API_KEY';
+  fs.writeFileSync('config.local.json', JSON.stringify(cfg, null, 4));
+"
+systemctl restart stremio-addon
+```
+
+### Advanced: Tunable thresholds
+
+All performance thresholds are configurable in `src/config.js`:
+
+| Threshold | Default | Description |
+|---|---|---|
+| `searchTimeout` | 10s | Per-indexer fetch timeout |
+| `searchGlobalTimeout` | 15s | Max total search time (returns partial results) |
+| `rdApiTimeout` | 15s | Real-Debrid API timeout |
+| `rdRetryDelayMs` | 1s | Initial retry delay on rate limits |
+| `rdMaxRetries` | 3 | Max retries on rate limit |
+| `magnetCheckDelay` | 300ms | Delay between cache checks |
+| `magnetCheckLimit` | 10 | Max hashes for cache check |
+| `zileanSeedBoost` | 50 | Synthetic seed count for Zilean results |

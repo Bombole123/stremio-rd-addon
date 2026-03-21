@@ -1,10 +1,11 @@
 const config = require('../config');
 const rd = require('../lib/realDebrid');
 const { getMetaByImdbId } = require('../lib/cinemeta');
-const { parse } = require('../lib/nameParser');
+const { parse, parseEpisodeFromPath } = require('../lib/nameParser');
 const { formatStreamName, formatStreamDescriptionFromSearch } = require('../lib/contentMapper');
 const { searchTorrents } = require('../lib/torrentSearch');
 const { getVideoHash } = require('../lib/torrentDb');
+const { getCachedPack } = require('../lib/seasonPackCache');
 
 function buildMultiCriteriaComparator(sortPriority) {
     const priority = sortPriority || ['quality', 'language', 'size', 'seeders', 'codec', 'source'];
@@ -56,9 +57,11 @@ function buildMultiCriteriaComparator(sortPriority) {
     };
 }
 
-async function streamHandler(type, id) {
+async function streamHandler(type, id, options = {}) {
     const startTime = Date.now();
-    console.log(`[stream] Request: type=${type} id=${id}`);
+    const rdToken = options.rdToken || config.rdApiToken;
+    const userId = options.userId || null;
+    console.log(`[stream] Request: type=${type} id=${id}${userId ? ` user=${userId.slice(0, 8)}...` : ''}`);
 
     const parts = id.split(':');
     const imdbId = parts[0];
@@ -79,7 +82,7 @@ async function streamHandler(type, id) {
         return { streams: [] };
     }
 
-    if (!config.rdApiToken) {
+    if (!rdToken) {
         console.log('[stream] No RD token configured');
         return { streams: [] };
     }
@@ -89,12 +92,72 @@ async function streamHandler(type, id) {
         : '';
     console.log(`[stream] Looking for: "${meta.name}" (${meta.year}) ${label}`);
 
+    // Check season pack cache for instant results (already in RD from previous episode)
+    let packStream = null;
+    if (type === 'series' && season !== null && episode !== null) {
+        const pack = getCachedPack(imdbId, season);
+        if (pack && pack.files && pack.links) {
+            const VIDEO_EXT = /\.(mkv|mp4|avi|mov|wmv|flv|webm|m4v|mpg|mpeg|ts)$/i;
+            const videoFiles = (pack.files || [])
+                .filter(f => f.selected === 1 && VIDEO_EXT.test(f.path));
+            const epFiles = videoFiles.filter(f => {
+                const ep = parseEpisodeFromPath(f.path);
+                return ep.season === season && ep.episode === episode;
+            });
+            if (epFiles.length > 0) {
+                console.log(`[stream] Season pack hit for ${imdbId} S${season}`);
+                const target = epFiles.reduce((best, f) =>
+                    (f.bytes || 0) > (best.bytes || 0) ? f : best
+                );
+                // Map file to its link by position among selected files
+                const selectedFiles = (pack.files || [])
+                    .filter(f => f.selected === 1)
+                    .sort((a, b) => a.id - b.id);
+                const linkIndex = selectedFiles.findIndex(f => f.id === target.id);
+                if (linkIndex !== -1 && linkIndex < pack.links.length) {
+                    const resolveBase = userId ? `${config.tunnelUrl}/${userId}` : config.tunnelUrl;
+                    const queryParams = [`type=${type}`, `imdbId=${imdbId}`, `season=${season}`, `episode=${episode}`];
+                    const resolveUrl = `${resolveBase}/resolve/${pack.hash}?${queryParams.join('&')}`;
+                    const parsed = parse(target.path.split('/').pop() || pack.hash);
+                    const hints = {
+                        filename: target.path.split('/').pop() || pack.hash,
+                        bingeGroup: `rd-${pack.hash}`,
+                    };
+                    const hashKey = `${pack.hash}:${season}:${episode}`;
+                    const cachedHash = getVideoHash(hashKey);
+                    if (cachedHash) {
+                        hints.videoHash = cachedHash.video_hash;
+                        hints.videoSize = cachedHash.video_size;
+                    } else if (target.bytes) {
+                        hints.videoSize = target.bytes;
+                    }
+                    packStream = {
+                        url: resolveUrl,
+                        name: formatStreamName(parsed),
+                        description: `${formatStreamDescriptionFromSearch(target.path.split('/').pop(), parsed, {}, target.bytes || 0)}\n[Instant - Season Pack]`,
+                        behaviorHints: hints,
+                        _quality: parsed.quality || null,
+                        _size: target.bytes || 0,
+                        _seeds: 9999, // Sort to top — already in RD
+                        _codec: parsed.codec || null,
+                        _source: parsed.source || null,
+                        _language: parsed.language || null,
+                    };
+                }
+            }
+        }
+    }
+
     // Step 2: Search torrent indexers for hashes
     const searchStart = Date.now();
     const torrents = await searchTorrents(imdbId, type, meta.name, meta.year, season, episode);
     const searchMs = Date.now() - searchStart;
     if (torrents.length === 0) {
         console.log(`[stream] No torrents found from indexers`);
+        if (packStream) {
+            const { _quality, _size, _seeds, _codec, _source, _language, ...packCleaned } = packStream;
+            return { streams: [packCleaned] };
+        }
         return { streams: [] };
     }
 
@@ -114,7 +177,7 @@ async function streamHandler(type, id) {
 
     // Step 3: Check which hashes are cached
     const cacheStart = Date.now();
-    const availability = await rd.checkInstantAvailability(config.rdApiToken, hashes);
+    const availability = await rd.checkInstantAvailability(rdToken, hashes);
     const cacheMs = Date.now() - cacheStart;
     const torrentMap = new Map(uniqueTorrents.map((t) => [t.hash, t]));
     const streams = [];
@@ -128,9 +191,10 @@ async function streamHandler(type, id) {
 
         const parsed = parse(torrent.title);
 
-        // Build resolve URL
-        let resolveUrl = `${config.tunnelUrl}/resolve/${torrent.hash}`;
-        const queryParams = [`type=${type}`];
+        // Build resolve URL — include userId prefix for per-user routing
+        const resolveBase = userId ? `${config.tunnelUrl}/${userId}` : config.tunnelUrl;
+        let resolveUrl = `${resolveBase}/resolve/${torrent.hash}`;
+        const queryParams = [`type=${type}`, `imdbId=${imdbId}`];
         if (type === 'series' && season !== null && episode !== null) {
             queryParams.push(`season=${season}`);
             queryParams.push(`episode=${episode}`);
@@ -240,6 +304,16 @@ async function streamHandler(type, id) {
     if (grouped['unknown']) limited.push(...grouped['unknown'].slice(0, perQuality));
 
     const cleaned = limited.map(({ _quality, _size, _seeds, _codec, _source, _language, ...rest }) => rest);
+
+    // Prepend the season pack instant stream if we have one (already in RD)
+    if (packStream) {
+        const { _quality, _size, _seeds, _codec, _source, _language, ...packCleaned } = packStream;
+        // Avoid duplicate if the same hash is already in the list
+        const isDuplicate = cleaned.some(s => s.url === packCleaned.url);
+        if (!isDuplicate) {
+            cleaned.unshift(packCleaned);
+        }
+    }
 
     console.log(`[stream] Returning ${cleaned.length} of ${streams.length} streams`);
     console.log(`[stream] ${type}/${imdbId} | ${metaMs}ms meta | ${searchMs}ms search (${uniqueTorrents.length} torrents) | ${cacheMs}ms cache | ${streams.length} streams | ${Date.now() - startTime}ms total`);

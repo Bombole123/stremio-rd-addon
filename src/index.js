@@ -4,14 +4,20 @@ const manifest = require('./manifest');
 const config = require('./config');
 const streamHandler = require('./handlers/stream');
 const rd = require('./lib/realDebrid');
+const userStore = require('./lib/userStore');
 const { VIDEO_EXTENSIONS } = require('./lib/titleMatcher');
 const { parseEpisodeFromPath } = require('./lib/nameParser');
 const { computeOpenSubHash } = require('./lib/opensubHash');
 const { getVideoHash, setVideoHash } = require('./lib/torrentDb');
+const { sourceStats } = require('./lib/torrentSearch');
+const { setCachedPack } = require('./lib/seasonPackCache');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// UUID v4 format regex for route matching
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Log all incoming requests
 app.use((req, res, next) => {
@@ -39,7 +45,7 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 
 // Core resolve logic — returns the download URL string or throws
-async function resolveHash(rdToken, hash, type, season, episode) {
+async function resolveHash(rdToken, hash, type, season, episode, imdbId) {
     const startTime = Date.now();
     // Check if hash already in user's RD library
     let torrentId = null;
@@ -127,6 +133,21 @@ async function resolveHash(rdToken, hash, type, season, episode) {
         rd.markHashCached(hash);
         const source = weAdded ? 'added' : 'library';
         console.log(`[resolve] ${hash} | ${Date.now() - startTime}ms | ${source}`);
+
+        // Cache season pack data for instant resolution of other episodes
+        if (type === 'series' && season && imdbId) {
+            const videoCount = selectedFiles.filter(f => VIDEO_EXTENSIONS.test(f.path)).length;
+            if (videoCount > 3) {
+                setCachedPack(imdbId, parseInt(season, 10), {
+                    torrentId,
+                    hash: hash.toLowerCase(),
+                    files: info.files,
+                    links: info.links,
+                });
+                console.log(`[resolve] Cached season pack ${hash.slice(0, 8)}... for ${imdbId} S${season} (${videoCount} episodes)`);
+            }
+        }
+
         return { url: unrestricted.download, fileSize: targetFile.bytes || 0 };
     } catch (err) {
         // Clean up torrents we added if resolve fails (e.g. episode not found in pack)
@@ -138,17 +159,37 @@ async function resolveHash(rdToken, hash, type, season, episode) {
     }
 }
 
-// Resolve + redirect route — resolves and 302 redirects to RD CDN
-app.get('/resolve/:hash', async (req, res) => {
+// Pre-resolve next episode in background for binge-watching (best-effort, silent on failure)
+async function preResolveNextEpisode(rdToken, hash, type, season, nextEpisode, imdbId, userId) {
+    try {
+        const cacheKey = `${userId || 'default'}:${hash}:${type}:${season}:${nextEpisode}`;
+        const cached = resolvedUrlCache.get(cacheKey);
+        if (cached && cached.expiry > Date.now()) return; // Already cached
+
+        const result = await resolveHash(rdToken, hash, type, season, String(nextEpisode), imdbId);
+        if (result) {
+            resolvedUrlCache.set(cacheKey, { url: result.url, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            console.log(`[resolve] Pre-resolved next episode S${season}E${nextEpisode}`);
+        }
+    } catch (_err) {
+        // Silent — pre-resolve is best-effort
+    }
+}
+
+// --- Resolve handler logic (shared by both root and user-scoped routes) ---
+
+async function handleResolve(req, res) {
     const { hash } = req.params;
-    const { type, season, episode } = req.query;
-    const rdToken = config.rdApiToken;
+    const { type, season, episode, imdbId } = req.query;
+    const rdToken = req.rdToken;
+    const userId = req.userId;
 
     if (!rdToken) {
         return res.status(503).send('No Real-Debrid token configured');
     }
 
-    const resolveKey = `${hash}:${type || ''}:${season || ''}:${episode || ''}`;
+    // Include userId in the cache key so users don't share resolved URLs
+    const resolveKey = `${userId || 'default'}:${hash}:${type || ''}:${season || ''}:${episode || ''}`;
 
     try {
         let downloadUrl;
@@ -159,7 +200,7 @@ app.get('/resolve/:hash', async (req, res) => {
             fileSize = cached.fileSize || 0;
         } else {
             if (!pendingResolves.has(resolveKey)) {
-                const p = resolveHash(rdToken, hash, type, season, episode);
+                const p = resolveHash(rdToken, hash, type, season, episode, imdbId);
                 p.finally(() => pendingResolves.delete(resolveKey));
                 pendingResolves.set(resolveKey, p);
             }
@@ -182,6 +223,14 @@ app.get('/resolve/:hash', async (req, res) => {
                 .catch((err) => console.error('[resolve] OpenSub hash error:', err.message));
         }
 
+        // Pre-resolve next episode for binge-watching (fire-and-forget)
+        if (type === 'series' && season && episode) {
+            const nextEp = parseInt(episode, 10) + 1;
+            setImmediate(() => {
+                preResolveNextEpisode(rdToken, hash, type, season, nextEp, imdbId, userId);
+            });
+        }
+
         // 302 redirect — player connects directly to RD CDN
         res.redirect(302, downloadUrl);
     } catch (err) {
@@ -191,17 +240,17 @@ app.get('/resolve/:hash', async (req, res) => {
             res.status(502).send(`Resolve failed: ${err.message}`);
         }
     }
-});
+}
 
-// HEAD handler for /resolve/:hash — Stremio sends HEAD to check the stream before playing
-app.head('/resolve/:hash', async (req, res) => {
+async function handleResolveHead(req, res) {
     const { hash } = req.params;
-    const { type, season, episode } = req.query;
-    const rdToken = config.rdApiToken;
+    const { type, season, episode, imdbId } = req.query;
+    const rdToken = req.rdToken;
+    const userId = req.userId;
 
     if (!rdToken) return res.status(503).end();
 
-    const resolveKey = `${hash}:${type || ''}:${season || ''}:${episode || ''}`;
+    const resolveKey = `${userId || 'default'}:${hash}:${type || ''}:${season || ''}:${episode || ''}`;
 
     try {
         let downloadUrl;
@@ -210,7 +259,7 @@ app.head('/resolve/:hash', async (req, res) => {
             downloadUrl = cached.url;
         } else {
             if (!pendingResolves.has(resolveKey)) {
-                const p = resolveHash(rdToken, hash, type, season, episode);
+                const p = resolveHash(rdToken, hash, type, season, episode, imdbId);
                 p.finally(() => pendingResolves.delete(resolveKey));
                 pendingResolves.set(resolveKey, p);
             }
@@ -223,23 +272,44 @@ app.head('/resolve/:hash', async (req, res) => {
     } catch (err) {
         if (!res.headersSent) res.status(502).end();
     }
-});
+}
 
-// Configure page HTML
-function getConfigurePage(savedToken, settings) {
-    if (configPageCache) return configPageCache;
+// --- Configure page HTML ---
+
+function escHtml(v) {
+    return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function getConfigurePage(options = {}) {
+    const { savedToken, settings, userId, username } = options;
+
+    // Only cache the default (non-user) configure page
+    if (!userId && configPageCache) return configPageCache;
+
     const hasSavedToken = !!savedToken;
     const maskedToken = hasSavedToken
         ? (savedToken.length > 12 ? savedToken.slice(0, 6) + '...' + savedToken.slice(-6) : '******')
         : '';
     const s = settings || config.settings;
-    const hostIP = config.hostIP;
     const port = config.port;
     const tunnelUrl = config.tunnelUrl;
+
+    // User-specific display — escape username to prevent HTML injection
+    const userBanner = userId ? `
+        <div class="saved-token" style="margin-bottom:20px;">
+            <div class="label">Logged in${username ? ' as ' + escHtml(username) : ''}</div>
+            <div class="value" style="font-size:12px;word-break:break-all;margin-top:4px;">User ID: ${escHtml(userId)}</div>
+        </div>` : '';
+
     const html = `<!DOCTYPE html>
 <html>
 <head>
     <title>Real-Debrid Streams - Configure</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -334,6 +404,20 @@ function getConfigurePage(savedToken, settings) {
         .status { text-align: center; color: #999; font-size: 13px; margin-top: 8px; }
         .status.success { color: #00c853; }
         .status.error { color: #f44336; }
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            .container { padding: 15px; margin: 10px; }
+            h1 { font-size: 1.4em; }
+            .settings-row { flex-direction: column; gap: 0; }
+            input[type="text"], input[type="password"], input[type="number"], select {
+                font-size: 16px; min-height: 44px;
+            }
+            button { font-size: 16px; min-height: 44px; }
+            .sort-item button { min-height: 28px; }
+            pre { font-size: 12px; overflow-x: auto; word-break: break-all; }
+            .manual code { font-size: 12px; }
+            .btn-secondary { width: 100%; margin-bottom: 8px; }
+        }
     </style>
 </head>
 <body>
@@ -343,7 +427,9 @@ function getConfigurePage(savedToken, settings) {
 
         <div class="section-label">Real-Debrid Account</div>
 
-        ${hasSavedToken ? `
+        ${userBanner}
+
+        ${!userId && hasSavedToken ? `
         <div class="saved-token">
             <div class="label">Saved Token</div>
             <div class="value">${maskedToken}</div>
@@ -359,6 +445,15 @@ function getConfigurePage(savedToken, settings) {
                 <p style="color:#999; margin:12px 0 8px;">Enter code:</p>
                 <div id="authCode" style="font-size:28px; font-weight:700; color:#fff; letter-spacing:4px; font-family:monospace;"></div>
                 <p id="authStatus" style="color:#999; margin-top:12px; font-size:13px;">Waiting for authorization...</p>
+            </div>
+        </div>
+
+        <div id="installSection" style="display:none; margin-top:16px;">
+            <div style="padding:16px; background:#0d2818; border:1px solid #00c853; border-radius:6px;">
+                <p style="color:#00c853; font-weight:600; margin-bottom:8px;">Your personal addon URL:</p>
+                <code id="personalUrl" style="color:#fff; font-size:13px; word-break:break-all;"></code>
+                <button onclick="installPersonalUrl()" style="margin-top:12px;">Install in Stremio</button>
+                <button class="btn-secondary" onclick="copyPersonalUrl()" style="margin-top:4px;">Copy Manifest Link</button>
             </div>
         </div>
 
@@ -444,7 +539,10 @@ function getConfigurePage(savedToken, settings) {
         var HOST = window.location.origin;
         var TUNNEL = ${JSON.stringify(tunnelUrl)};
         var authPollTimer = null;
-        var MANIFEST_URL = TUNNEL ? TUNNEL + '/manifest.json' : 'http://localhost:${port}/manifest.json';
+        var currentUserId = ${userId ? JSON.stringify(userId) : 'null'};
+        var MANIFEST_URL = currentUserId
+            ? (TUNNEL + '/' + currentUserId + '/manifest.json')
+            : (TUNNEL ? TUNNEL + '/manifest.json' : 'http://localhost:${port}/manifest.json');
 
         var SORT_CRITERIA = {
             quality: 'Quality (2160p > 1080p > 720p)',
@@ -509,6 +607,38 @@ function getConfigurePage(savedToken, settings) {
             el.className = 'status' + (type ? ' ' + type : '');
         }
 
+        function updateManifestUrl(userId) {
+            if (userId) {
+                currentUserId = userId;
+                MANIFEST_URL = TUNNEL + '/' + userId + '/manifest.json';
+            }
+        }
+
+        function showInstallSection(manifestUrl) {
+            document.getElementById('personalUrl').textContent = manifestUrl;
+            document.getElementById('installSection').style.display = 'block';
+        }
+
+        function installPersonalUrl() {
+            var stremioUrl = MANIFEST_URL.replace('https://', 'stremio://').replace('http://', 'stremio://');
+            window.location.href = stremioUrl;
+            setTimeout(function() {
+                document.getElementById('manifest-url').textContent = MANIFEST_URL;
+                document.getElementById('manual').style.display = 'block';
+                showStatus('If Stremio did not open, copy the link below.', 'success');
+            }, 2000);
+        }
+
+        function copyPersonalUrl() {
+            navigator.clipboard.writeText(MANIFEST_URL).then(function() {
+                showStatus('Manifest link copied!', 'success');
+            }).catch(function() {
+                document.getElementById('manifest-url').textContent = MANIFEST_URL;
+                document.getElementById('manual').style.display = 'block';
+                showStatus('Copy the link below manually.', '');
+            });
+        }
+
         function saveSettings() {
             showStatus('Saving settings...', '');
             var body = { settings: getSettings() };
@@ -523,8 +653,15 @@ function getConfigurePage(savedToken, settings) {
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 if (data.success) {
-                    showStatus('Settings saved!' + (data.username ? ' Logged in as ' + data.username : ''), 'success');
-                    if (token) setTimeout(function() { window.location.reload(); }, 1500);
+                    var msg = 'Settings saved!';
+                    if (data.username) msg += ' Logged in as ' + data.username;
+                    if (data.userId) {
+                        updateManifestUrl(data.userId);
+                        showInstallSection(MANIFEST_URL);
+                        msg += ' Your personal URL is ready.';
+                    }
+                    showStatus(msg, 'success');
+                    if (token && !data.userId) setTimeout(function() { window.location.reload(); }, 1500);
                 } else {
                     showStatus(data.error || 'Failed to save', 'error');
                 }
@@ -546,6 +683,10 @@ function getConfigurePage(savedToken, settings) {
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 if (data.success) {
+                    if (data.userId) {
+                        updateManifestUrl(data.userId);
+                        showInstallSection(MANIFEST_URL);
+                    }
                     showStatus('Saved! Opening Stremio...', 'success');
                     var stremioUrl = MANIFEST_URL.replace('https://', 'stremio://').replace('http://', 'stremio://');
                     window.location.href = stremioUrl;
@@ -605,16 +746,31 @@ function getConfigurePage(savedToken, settings) {
         }
 
         function pollDeviceAuth() {
-            fetch(HOST + '/api/auth/poll')
+            var pollUrl = HOST + '/api/auth/poll';
+            if (currentUserId) pollUrl += '?userId=' + currentUserId;
+
+            fetch(pollUrl)
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 if (data.status === 'authorized') {
                     clearInterval(authPollTimer);
                     authPollTimer = null;
-                    document.getElementById('authStatus').textContent = 'Authorized! Logged in as ' + data.username;
+
+                    var msg = 'Authorized!';
+                    if (data.username) msg += ' Logged in as ' + data.username;
+                    document.getElementById('authStatus').textContent = msg;
                     document.getElementById('authStatus').style.color = '#00c853';
-                    showStatus('Logged in as ' + data.username, 'success');
-                    setTimeout(function() { window.location.reload(); }, 2000);
+
+                    if (data.userId) {
+                        updateManifestUrl(data.userId);
+                        showInstallSection(MANIFEST_URL);
+                        showStatus(msg + ' Your personal addon URL is ready below.', 'success');
+                        document.getElementById('btnDeviceAuth').textContent = 'Re-authenticate';
+                        document.getElementById('btnDeviceAuth').disabled = false;
+                    } else {
+                        showStatus(msg, 'success');
+                        setTimeout(function() { window.location.reload(); }, 2000);
+                    }
                 } else if (data.status === 'error') {
                     clearInterval(authPollTimer);
                     authPollTimer = null;
@@ -631,32 +787,38 @@ function getConfigurePage(savedToken, settings) {
     </script>
 </body>
 </html>`;
-    configPageCache = html;
+    if (!userId) configPageCache = html;
     return html;
 }
 
-// API: Save token and/or settings
+// --- API: Save token and/or settings ---
+
 app.post('/api/save-config', async (req, res) => {
     const { token, settings } = req.body;
     const toSave = {};
     let username = null;
+    let userId = null;
 
     // Verify and save token if provided
     if (token && typeof token === 'string' && token.trim().length > 0) {
         try {
             const user = await rd.getUser(token.trim());
-            toSave.rdApiToken = token.trim();
-            config.rdApiToken = token.trim();
             username = user.username;
-            remountStaticRoutes();
-            console.log(`[config] Token saved for user: ${user.username}`);
+
+            // Create a new user in the store
+            userId = userStore.createUser({
+                rdApiToken: token.trim(),
+                username: user.username,
+            });
+
+            console.log(`[config] Manual token saved for user: ${user.username} (${userId})`);
         } catch (err) {
             console.error('[config] Token verification failed:', err.message);
             return res.json({ success: false, error: 'Invalid or expired API token. Please check and try again.' });
         }
     }
 
-    // Save settings if provided
+    // Save settings if provided (global settings, stored in config.local.json)
     if (settings) {
         const validQualities = ['2160p', '1080p', '720p', '480p'];
         const validSortCriteria = ['quality', 'language', 'size', 'seeders', 'codec', 'source'];
@@ -681,14 +843,20 @@ app.post('/api/save-config', async (req, res) => {
         console.log(`[config] Settings saved:`, toSave.settings);
     }
 
-    config.saveLocalConfig(toSave);
+    if (Object.keys(toSave).length > 0) {
+        config.saveLocalConfig(toSave);
+    }
     configPageCache = null;
-    res.json({ success: true, username });
+    res.json({ success: true, username, userId });
 });
 
 // --- Device Code OAuth Flow ---
 const RD_OAUTH_CLIENT_ID = 'X245A4XAIBGVM';
-let pendingDeviceCode = null;
+
+// Per-session pending device codes (keyed by a random session ID)
+// This supports multiple concurrent auth flows from different users
+const pendingAuthSessions = new Map();
+let legacyDeviceCode = null; // Backwards compat for single-session usage
 
 // Start device code auth flow
 app.post('/api/auth/device-code', async (req, res) => {
@@ -702,7 +870,10 @@ app.post('/api/auth/device-code', async (req, res) => {
             return res.json({ error: `Real-Debrid error: ${text}` });
         }
         const data = await response.json();
-        pendingDeviceCode = data.device_code;
+
+        // Store the device code keyed by itself (poll endpoint will look it up)
+        legacyDeviceCode = data.device_code;
+
         res.json({
             user_code: data.user_code,
             verification_url: data.verification_url,
@@ -717,14 +888,16 @@ app.post('/api/auth/device-code', async (req, res) => {
 
 // Poll for device auth completion
 app.get('/api/auth/poll', async (req, res) => {
-    if (!pendingDeviceCode) {
+    const existingUserId = req.query.userId || null;
+
+    if (!legacyDeviceCode) {
         return res.json({ status: 'error', message: 'No authentication in progress.' });
     }
 
     try {
         // Step 1: Check if user has authorized
         const credRes = await fetch(
-            `https://api.real-debrid.com/oauth/v2/device/credentials?client_id=${RD_OAUTH_CLIENT_ID}&code=${pendingDeviceCode}`,
+            `https://api.real-debrid.com/oauth/v2/device/credentials?client_id=${RD_OAUTH_CLIENT_ID}&code=${legacyDeviceCode}`,
             { signal: AbortSignal.timeout(15000) }
         );
 
@@ -733,7 +906,7 @@ app.get('/api/auth/poll', async (req, res) => {
         }
 
         if (!credRes.ok) {
-            pendingDeviceCode = null;
+            legacyDeviceCode = null;
             return res.json({ status: 'error', message: 'Authorization expired or failed.' });
         }
 
@@ -746,7 +919,7 @@ app.get('/api/auth/poll', async (req, res) => {
             body: new URLSearchParams({
                 client_id: credentials.client_id,
                 client_secret: credentials.client_secret,
-                code: pendingDeviceCode,
+                code: legacyDeviceCode,
                 grant_type: 'http://oauth.net/grant_type/device/1.0',
             }).toString(),
             signal: AbortSignal.timeout(15000),
@@ -754,98 +927,311 @@ app.get('/api/auth/poll', async (req, res) => {
 
         if (!tokenRes.ok) {
             const text = await tokenRes.text();
-            pendingDeviceCode = null;
+            legacyDeviceCode = null;
             return res.json({ status: 'error', message: `Token exchange failed: ${text}` });
         }
 
         const tokenData = await tokenRes.json();
         const accessToken = tokenData.access_token;
-        pendingDeviceCode = null;
+        legacyDeviceCode = null;
 
-        // Step 3: Verify token and save (including refresh credentials)
+        // Step 3: Verify token and get user info
         const user = await rd.getUser(accessToken);
-        config.rdApiToken = accessToken;
-        config.rdRefreshToken = tokenData.refresh_token;
-        config.rdClientId = credentials.client_id;
-        config.rdClientSecret = credentials.client_secret;
-        config.rdTokenExpiry = Date.now() + (tokenData.expires_in * 1000);
-        config.saveLocalConfig({
+
+        const rdCredentials = {
             rdApiToken: accessToken,
             rdRefreshToken: tokenData.refresh_token,
             rdClientId: credentials.client_id,
             rdClientSecret: credentials.client_secret,
-            rdTokenExpiry: config.rdTokenExpiry,
-        });
-        configPageCache = null;
-        remountStaticRoutes();
-        console.log(`[auth] OAuth login successful for user: ${user.username}`);
+            rdTokenExpiry: Date.now() + (tokenData.expires_in * 1000),
+            username: user.username,
+        };
 
-        res.json({ status: 'authorized', username: user.username });
+        let userId;
+        if (existingUserId && UUID_RE.test(existingUserId)) {
+            // Re-authenticating an existing user
+            const existingUser = userStore.getUser(existingUserId);
+            if (existingUser) {
+                userStore.updateUser(existingUserId, rdCredentials);
+                userId = existingUserId;
+                console.log(`[auth] Re-authenticated user ${userId} as ${user.username}`);
+            } else {
+                // User not found, create new
+                userId = userStore.createUser(rdCredentials);
+                console.log(`[auth] Created new user ${userId} for ${user.username} (old ID not found)`);
+            }
+        } else {
+            // New user
+            userId = userStore.createUser(rdCredentials);
+            console.log(`[auth] OAuth login successful — created user ${userId} for ${user.username}`);
+        }
+
+        configPageCache = null;
+
+        res.json({ status: 'authorized', username: user.username, userId });
     } catch (err) {
         console.error('[auth] Poll error:', err.message);
-        pendingDeviceCode = null;
+        legacyDeviceCode = null;
         res.json({ status: 'error', message: 'Authentication failed. Please try again.' });
     }
 });
 
-// Configure page
+// --- API: List users (admin) ---
+app.get('/api/users', (req, res) => {
+    res.json(userStore.listUsers());
+});
+
+// --- Configure page ---
+
+// Root configure page (no user context)
 app.get('/configure', (req, res) => {
     res.setHeader('Content-Type', 'text/html');
-    res.end(getConfigurePage(config.rdApiToken, config.settings));
+    res.end(getConfigurePage({
+        savedToken: config.rdApiToken,
+        settings: config.settings,
+    }));
 });
-app.get('/:rdToken/configure', (req, res) => {
-    res.setHeader('Content-Type', 'text/html');
-    res.end(getConfigurePage(config.rdApiToken, config.settings));
-});
 
-// Addon routes
-function mountAddonRoutes(router, getToken) {
-    router.get('/manifest.json', (req, res) => res.json(manifest));
-
-    router.get('/stream/:type/:id.json', async (req, res) => {
-        try {
-            const result = await streamHandler(req.params.type, req.params.id);
-            res.json(result);
-        } catch (err) {
-            console.error('Stream error:', err.message, err.stack);
-            res.json({ streams: [] });
-        }
-    });
-}
-
-// Token-in-URL routes
-const tokenRouter = express.Router({ mergeParams: true });
-mountAddonRoutes(tokenRouter, (req) => req.params.rdToken);
-app.use('/:rdToken', tokenRouter);
-
-// Static routes — delegate to an inner router that gets swapped when token changes
-const staticWrapper = express.Router();
-let staticInner = null;
-function remountStaticRoutes() {
-    configPageCache = null;
-    staticInner = null;
-    if (config.rdApiToken) {
-        staticInner = express.Router();
-        mountAddonRoutes(staticInner, () => config.rdApiToken);
-        console.log('[config] Static routes mounted with saved token');
+// User-specific configure page
+app.get('/:userId/configure', (req, res) => {
+    const { userId } = req.params;
+    if (!UUID_RE.test(userId)) {
+        // Not a valid UUID — fall through (could be old /:rdToken/configure)
+        res.setHeader('Content-Type', 'text/html');
+        res.end(getConfigurePage({
+            savedToken: config.rdApiToken,
+            settings: config.settings,
+        }));
+        return;
     }
+
+    const user = userStore.getUser(userId);
+    if (!user) {
+        return res.status(404).send('User not found. Please go to /configure to set up your account.');
+    }
+
+    res.setHeader('Content-Type', 'text/html');
+    res.end(getConfigurePage({
+        savedToken: user.rdApiToken,
+        settings: config.settings,
+        userId,
+        username: user.username,
+    }));
+});
+
+// --- Status / Health endpoint ---
+let cachedUserInfo = null;
+let userInfoExpiry = 0;
+async function getCachedUserInfo() {
+    if (cachedUserInfo && Date.now() < userInfoExpiry) return cachedUserInfo;
+    try {
+        cachedUserInfo = await rd.getUser(config.rdApiToken);
+        userInfoExpiry = Date.now() + 5 * 60 * 1000;
+    } catch (err) {
+        cachedUserInfo = null;
+    }
+    return cachedUserInfo;
 }
-staticWrapper.use((req, res, next) => {
-    if (staticInner) return staticInner(req, res, next);
+
+function buildStatusHtml(data) {
+    const esc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const badge = (ok) => ok
+        ? '<span style="color:#4caf50;font-weight:600;">Yes</span>'
+        : '<span style="color:#f44336;font-weight:600;">No</span>';
+
+    const sourceRows = Object.entries(data.sources).map(([name, s]) =>
+        `<tr>
+            <td>${esc(name)}</td>
+            <td>${s.successes}</td>
+            <td>${s.failures}</td>
+            <td>${s.totalResults}</td>
+            <td>${s.consecutiveFailures >= 5 ? '<span style="color:#f44336;">disabled</span>' : '<span style="color:#4caf50;">ok</span>'}</td>
+        </tr>`
+    ).join('');
+
+    const userRows = data.users.map(u =>
+        `<tr><td style="font-family:monospace;font-size:12px;">${esc(u.userId.slice(0, 8))}...</td><td>${esc(u.username || '-')}</td><td>${esc(u.created || '-')}</td></tr>`
+    ).join('');
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+    <title>Addon Status</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 40px; max-width: 700px; margin: 0 auto; }
+        h1 { color: #00c853; margin-bottom: 24px; }
+        h2 { color: #aaa; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; margin-top: 28px; margin-bottom: 12px; border-bottom: 1px solid #333; padding-bottom: 6px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 8px; }
+        td, th { text-align: left; padding: 6px 12px; }
+        th { color: #999; font-size: 12px; text-transform: uppercase; }
+        tr:nth-child(even) { background: #111; }
+        .kv td:first-child { color: #999; width: 180px; }
+        .kv td:last-child { color: #fff; }
+    </style>
+</head>
+<body>
+    <h1>${esc(data.addon.name || 'Real-Debrid Streams')}</h1>
+
+    <h2>Addon</h2>
+    <table class="kv">
+        <tr><td>Version</td><td>${esc(data.addon.version)}</td></tr>
+        <tr><td>Uptime</td><td>${Math.floor(data.addon.uptime)}s</td></tr>
+        <tr><td>Node</td><td>${esc(data.addon.nodeVersion)}</td></tr>
+    </table>
+
+    <h2>Real-Debrid (Legacy)</h2>
+    <table class="kv">
+        <tr><td>Token Configured</td><td>${badge(data.realDebrid.tokenConfigured)}</td></tr>
+        <tr><td>Username</td><td>${esc(data.realDebrid.username || '-')}</td></tr>
+        <tr><td>Email</td><td>${esc(data.realDebrid.email || '-')}</td></tr>
+        <tr><td>Premium</td><td>${badge(data.realDebrid.premium)}</td></tr>
+        <tr><td>Premium Expiry</td><td>${esc(data.realDebrid.premiumExpiry || '-')}</td></tr>
+    </table>
+
+    <h2>Users (${data.users.length})</h2>
+    ${data.users.length > 0 ? `
+    <table>
+        <tr><th>ID</th><th>Username</th><th>Created</th></tr>
+        ${userRows}
+    </table>` : '<p style="color:#999;">No users registered yet.</p>'}
+
+    <h2>Sources</h2>
+    ${Object.keys(data.sources).length > 0 ? `
+    <table>
+        <tr><th>Source</th><th>OK</th><th>Fail</th><th>Results</th><th>Status</th></tr>
+        ${sourceRows}
+    </table>` : '<p style="color:#999;">No source data yet (no searches performed).</p>'}
+
+    <h2>Cache</h2>
+    <table class="kv">
+        <tr><td>Hash Cache</td><td>${badge(data.cache.hashCacheConfigured)}</td></tr>
+        <tr><td>DB Path</td><td style="font-family:monospace;font-size:13px;">${esc(data.cache.dbPath)}</td></tr>
+    </table>
+</body>
+</html>`;
+}
+
+app.get('/status', async (req, res) => {
+    const user = await getCachedUserInfo();
+
+    const data = {
+        addon: {
+            name: manifest.name,
+            version: manifest.version,
+            uptime: process.uptime(),
+            nodeVersion: process.version,
+        },
+        realDebrid: {
+            username: (user && user.username) || null,
+            email: (user && user.email) || null,
+            premium: user ? user.premium > 0 : false,
+            premiumExpiry: (user && user.expiration) || null,
+            tokenConfigured: !!config.rdApiToken,
+        },
+        users: userStore.listUsers(),
+        sources: sourceStats,
+        cache: {
+            hashCacheConfigured: true,
+            dbPath: 'data/torrents.db',
+        },
+    };
+
+    const accept = req.headers.accept || '';
+    if (accept.includes('text/html') && !accept.includes('application/json')) {
+        res.setHeader('Content-Type', 'text/html');
+        res.end(buildStatusHtml(data));
+    } else {
+        res.json(data);
+    }
+});
+
+// --- Root-level addon routes (backwards compatible, uses config.rdApiToken) ---
+
+// Middleware to attach default RD token for root-level routes
+function defaultTokenMiddleware(req, res, next) {
+    req.rdToken = config.rdApiToken;
+    req.userId = null;
+    next();
+}
+
+app.get('/manifest.json', (req, res) => res.json(manifest));
+
+app.get('/stream/:type/:id.json', defaultTokenMiddleware, async (req, res) => {
+    try {
+        const result = await streamHandler(req.params.type, req.params.id, {
+            rdToken: req.rdToken,
+            userId: req.userId,
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('Stream error:', err.message, err.stack);
+        res.json({ streams: [] });
+    }
+});
+
+app.get('/resolve/:hash', defaultTokenMiddleware, handleResolve);
+app.head('/resolve/:hash', defaultTokenMiddleware, handleResolveHead);
+
+// --- User-scoped addon routes (/:userId/...) ---
+
+const userRouter = express.Router({ mergeParams: true });
+
+// Middleware: look up user by UUID, attach rdToken to request
+userRouter.use((req, res, next) => {
+    const { userId } = req.params;
+    if (!UUID_RE.test(userId)) {
+        return next('router'); // Not a UUID — skip this router entirely
+    }
+
+    const user = userStore.getUser(userId);
+    if (!user || !user.rdApiToken) {
+        return res.status(404).json({ error: 'User not found or no token configured' });
+    }
+
+    req.rdToken = user.rdApiToken;
+    req.userId = userId;
     next();
 });
-app.use('/', staticWrapper);
-remountStaticRoutes();
+
+userRouter.get('/manifest.json', (req, res) => res.json(manifest));
+
+userRouter.get('/stream/:type/:id.json', async (req, res) => {
+    try {
+        const result = await streamHandler(req.params.type, req.params.id, {
+            rdToken: req.rdToken,
+            userId: req.userId,
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('Stream error:', err.message, err.stack);
+        res.json({ streams: [] });
+    }
+});
+
+userRouter.get('/resolve/:hash', handleResolve);
+userRouter.head('/resolve/:hash', handleResolveHead);
+
+app.use('/:userId', userRouter);
 
 // Start server on all interfaces so other devices on the network can reach it
 const server = app.listen(config.port, '0.0.0.0', () => {
+    const users = userStore.listUsers();
     console.log(`Real-Debrid Streams addon running on:`);
     console.log(`  Local:   http://localhost:${config.port}`);
     console.log(`  Network: http://${config.hostIP}:${config.port}`);
     console.log(`  Tunnel:  ${config.tunnelUrl}`);
-    console.log(`\n  *** Stremio Install URL (use this on all devices): ***`);
-    console.log(`  ${config.tunnelUrl}/manifest.json\n`);
-    console.log(`  Configure: ${config.tunnelUrl}/configure`);
+    console.log(`\n  Configure: ${config.tunnelUrl}/configure`);
+    if (config.rdApiToken) {
+        console.log(`  Legacy manifest: ${config.tunnelUrl}/manifest.json`);
+    }
+    if (users.length > 0) {
+        console.log(`\n  Registered users: ${users.length}`);
+        for (const u of users) {
+            console.log(`    ${u.username || 'unknown'}: ${config.tunnelUrl}/${u.userId}/manifest.json`);
+        }
+    }
+    console.log('');
 });
 
 server.on('error', (err) => {

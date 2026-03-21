@@ -18,22 +18,22 @@ echo "╚═══════════════════════�
 echo ""
 
 # ── 1. System packages ───────────────────────────────────────
-echo "[1/7] Installing system dependencies..."
+echo "[1/8] Installing system dependencies..."
 apt-get update -qq
 apt-get install -y -qq curl gnupg build-essential python3 git ca-certificates > /dev/null
 
 # ── 2. Node.js ───────────────────────────────────────────────
 if ! command -v node &> /dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt "$NODE_MAJOR" ]; then
-    echo "[2/7] Installing Node.js ${NODE_MAJOR}..."
+    echo "[2/8] Installing Node.js ${NODE_MAJOR}..."
     curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - > /dev/null 2>&1
     apt-get install -y -qq nodejs > /dev/null
 else
-    echo "[2/7] Node.js $(node -v) already installed"
+    echo "[2/8] Node.js $(node -v) already installed"
 fi
 NODE_BIN="$(which node)"
 
 # ── 3. Create app user ───────────────────────────────────────
-echo "[3/7] Setting up app user and directory..."
+echo "[3/8] Setting up app user and directory..."
 if ! id "$APP_USER" &>/dev/null; then
     useradd -r -s /usr/sbin/nologin -m -d "$APP_DIR" "$APP_USER"
 else
@@ -42,7 +42,7 @@ fi
 mkdir -p "$APP_DIR/data"
 
 # ── 4. Copy application ──────────────────────────────────────
-echo "[4/7] Installing application..."
+echo "[4/8] Installing application..."
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Copy source files
@@ -65,7 +65,7 @@ cd "$APP_DIR"
 npm install --omit=dev --quiet 2>&1 || { echo "npm install failed"; exit 1; }
 
 # ── 5. Detect LXC IP ─────────────────────────────────────────
-echo "[5/7] Detecting network configuration..."
+echo "[5/8] Detecting network configuration..."
 HOST_IP=$(hostname -I | awk '{print $1}')
 
 # Update hostIP in config.local.json
@@ -81,7 +81,7 @@ APP_DIR="$APP_DIR" HOST_IP="$HOST_IP" node -e "
 echo "     LXC IP: $HOST_IP"
 
 # ── 6. Set permissions ────────────────────────────────────────
-echo "[6/7] Setting permissions..."
+echo "[6/8] Setting permissions..."
 chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 # ── 7. Create systemd service ────────────────────────────────
@@ -93,7 +93,7 @@ SystemMaxUse=100M
 JEOF
 systemctl restart systemd-journald
 
-echo "[7/7] Creating systemd service..."
+echo "[7/8] Creating systemd service..."
 cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
 Description=Stremio Real-Debrid Addon
@@ -129,6 +129,43 @@ systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" --quiet
 systemctl restart "$SERVICE_NAME"
 
+# ── 8. Auto-update timer ──────────────────────────────────────
+echo "[8/8] Setting up auto-update timer..."
+
+# Copy update script
+mkdir -p "$APP_DIR/scripts"
+cp "$SCRIPT_DIR/scripts/update.sh" "$APP_DIR/scripts/update.sh" 2>/dev/null || true
+chmod +x "$APP_DIR/scripts/update.sh"
+
+# Create auto-update timer (4am EST / 9am UTC daily)
+cat > /etc/systemd/system/stremio-update.timer <<TEOF
+[Unit]
+Description=Auto-update Stremio addon daily
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+TEOF
+
+cat > /etc/systemd/system/stremio-update.service <<SUEOF
+[Unit]
+Description=Stremio addon auto-update
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/stremio-addon/scripts/update.sh
+User=root
+SUEOF
+
+systemctl daemon-reload
+systemctl enable stremio-update.timer --quiet
+systemctl start stremio-update.timer
+
 # ── Verify ────────────────────────────────────────────────────
 for i in 1 2 3 4 5; do
     systemctl is-active --quiet "$SERVICE_NAME" && break
@@ -142,6 +179,8 @@ if systemctl is-active --quiet "$SERVICE_NAME"; then
     echo ""
     echo "  Addon running at: http://${HOST_IP}:${PORT}"
     echo "  Configure:        http://${HOST_IP}:${PORT}/configure"
+    echo ""
+    echo "  Auto-update: daily at 4:00 AM EST (9:00 UTC)"
     echo ""
     echo "  Service commands:"
     echo "    systemctl status  ${SERVICE_NAME}"

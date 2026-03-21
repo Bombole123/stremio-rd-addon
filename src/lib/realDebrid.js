@@ -1,5 +1,6 @@
 const config = require('../config');
 const Cache = require('./cache');
+const userStore = require('./userStore');
 
 const cache = new Cache();
 
@@ -12,10 +13,24 @@ function tokenKey(token) {
 }
 
 // --- Token refresh logic ---
-let refreshPromise = null;
+// Per-key refresh promises to deduplicate concurrent refreshes
+const refreshPromises = new Map();
 
-async function refreshAccessToken() {
-    const { rdRefreshToken, rdClientId, rdClientSecret } = config;
+async function refreshAccessToken(userId) {
+    let rdRefreshToken, rdClientId, rdClientSecret;
+
+    if (userId) {
+        const user = userStore.getUser(userId);
+        if (!user) throw new Error('User not found for token refresh');
+        rdRefreshToken = user.rdRefreshToken;
+        rdClientId = user.rdClientId;
+        rdClientSecret = user.rdClientSecret;
+    } else {
+        rdRefreshToken = config.rdRefreshToken;
+        rdClientId = config.rdClientId;
+        rdClientSecret = config.rdClientSecret;
+    }
+
     if (!rdRefreshToken || !rdClientId || !rdClientSecret) {
         throw new Error('Missing refresh credentials — re-authenticate via OAuth');
     }
@@ -38,39 +53,50 @@ async function refreshAccessToken() {
     }
 
     const data = await res.json();
+    const newExpiry = Date.now() + (data.expires_in * 1000);
 
-    // Update in-memory config
-    config.rdApiToken = data.access_token;
-    config.rdRefreshToken = data.refresh_token;
-    config.rdTokenExpiry = Date.now() + (data.expires_in * 1000);
-
-    // Persist to disk
-    config.saveLocalConfig({
-        rdApiToken: data.access_token,
-        rdRefreshToken: data.refresh_token,
-        rdTokenExpiry: config.rdTokenExpiry,
-    });
+    if (userId) {
+        // Persist to user store
+        userStore.updateUser(userId, {
+            rdApiToken: data.access_token,
+            rdRefreshToken: data.refresh_token,
+            rdTokenExpiry: newExpiry,
+        });
+    } else {
+        // Update in-memory config + persist to disk (legacy)
+        config.rdApiToken = data.access_token;
+        config.rdRefreshToken = data.refresh_token;
+        config.rdTokenExpiry = newExpiry;
+        config.saveLocalConfig({
+            rdApiToken: data.access_token,
+            rdRefreshToken: data.refresh_token,
+            rdTokenExpiry: newExpiry,
+        });
+    }
 
     return data.access_token;
 }
 
-async function tryRefreshToken() {
-    // If a refresh is already in flight, piggy-back on it
-    if (refreshPromise) return refreshPromise;
+async function tryRefreshToken(userId) {
+    const key = userId || '__default__';
 
-    refreshPromise = refreshAccessToken()
+    // If a refresh is already in flight for this key, piggy-back on it
+    if (refreshPromises.has(key)) return refreshPromises.get(key);
+
+    const promise = refreshAccessToken(userId)
         .then((newToken) => {
-            console.log('[auth] Access token refreshed successfully');
-            refreshPromise = null;
+            console.log(`[auth] Access token refreshed successfully${userId ? ` for user ${userId.slice(0, 8)}...` : ''}`);
+            refreshPromises.delete(key);
             return newToken;
         })
         .catch((err) => {
-            console.error('[auth] Token refresh failed:', err.message);
-            refreshPromise = null;
+            console.error(`[auth] Token refresh failed${userId ? ` for user ${userId.slice(0, 8)}...` : ''}:`, err.message);
+            refreshPromises.delete(key);
             throw err;
         });
 
-    return refreshPromise;
+    refreshPromises.set(key, promise);
+    return promise;
 }
 
 // --- Core API request with automatic 401 retry ---
@@ -111,6 +137,7 @@ function handleNonAuthErrors(res) {
 async function apiRequest(endpoint, token, options = {}) {
     const maxRetries = config.thresholds?.rdMaxRetries || 3;
     const baseDelay = config.thresholds?.rdRetryDelayMs || 1000;
+    const userId = options.userId || null;
     let delay = baseDelay;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -119,7 +146,8 @@ async function apiRequest(endpoint, token, options = {}) {
         // On 401, attempt a transparent token refresh and retry once
         if (res.status === 401) {
             try {
-                const newToken = await tryRefreshToken();
+                const newToken = await tryRefreshToken(userId);
+                token = newToken;
                 res = await doFetch(endpoint, newToken, options);
             } catch (_refreshErr) {
                 // Refresh failed — throw the original 401 error
