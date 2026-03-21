@@ -1,4 +1,5 @@
 const Cache = require('./cache');
+const config = require('../config');
 const { parse } = require('./nameParser');
 const torrentDb = require('./torrentDb');
 
@@ -292,7 +293,7 @@ async function searchZilean(imdbId, season, episode) {
                 hash: t.infoHash.toLowerCase(),
                 title: t.rawTitle || t.filename || 'Unknown',
                 size: parseInt(t.size, 10) || 0,
-                seeds: 0, // Zilean doesn't track seeders
+                seeds: config.thresholds.zileanSeedBoost || 50, // Zilean doesn't track seeders — boost so they sort competitively
                 source: 'Zilean',
             }));
     } catch (err) {
@@ -360,8 +361,43 @@ async function liveSearch(imdbId, type, title, year, season, episode) {
         searches.push(searchTorrentGalaxy(query));
     }
 
-    const results = await Promise.all(searches);
-    let all = results.flat();
+    const totalSources = searches.length;
+    const startTime = Date.now();
+
+    // Wrap each search so we can collect partial results on timeout.
+    // Each wrapper resolves with the search result (or [] on error) and stores it immediately.
+    const results = new Array(totalSources).fill(null);
+    const wrapped = searches.map((p, i) =>
+        p.then(v => { results[i] = v; }).catch(() => { results[i] = []; })
+    );
+
+    let timedOut = false;
+    const allDone = Promise.all(wrapped);
+    let timeoutHandle;
+    const timer = new Promise(resolve => {
+        timeoutHandle = setTimeout(resolve, config.thresholds.searchGlobalTimeout || 15000);
+    }).then(() => { timedOut = true; });
+
+    // Race: either all searches finish, or the global timeout fires
+    await Promise.race([allDone, timer]);
+    clearTimeout(timeoutHandle);
+
+    // Collect results — fulfilled searches have their array in results[i], pending ones are still null
+    let all = [];
+    let responded = 0;
+    for (let i = 0; i < totalSources; i++) {
+        if (results[i] !== null) {
+            responded++;
+            all.push(...results[i]);
+        }
+    }
+
+    const elapsed = Date.now() - startTime;
+    if (timedOut) {
+        console.log(`[search] Global timeout after ${elapsed}ms — ${responded}/${totalSources} sources responded`);
+    } else {
+        console.log(`[search] ${responded}/${totalSources} sources responded in ${elapsed}ms`);
+    }
 
     // Deduplicate by hash
     const seen = new Set();

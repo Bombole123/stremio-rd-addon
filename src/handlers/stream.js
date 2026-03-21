@@ -93,12 +93,23 @@ async function streamHandler(type, id) {
         return { streams: [] };
     }
 
-    const hashes = torrents.map((t) => t.hash);
+    // Deduplicate by hash — keep the torrent with highest seed count
+    const deduped = new Map();
+    for (const torrent of torrents) {
+        const existing = deduped.get(torrent.hash);
+        if (!existing || (torrent.seeds || 0) > (existing.seeds || 0)) {
+            deduped.set(torrent.hash, torrent);
+        }
+    }
+    const uniqueTorrents = [...deduped.values()];
+    console.log(`[stream] ${torrents.length} torrents deduplicated to ${uniqueTorrents.length}`);
+
+    const hashes = uniqueTorrents.map((t) => t.hash);
     console.log(`[stream] Checking ${hashes.length} hashes against RD cache`);
 
     // Step 3: Check which hashes are cached
     const availability = await rd.checkInstantAvailability(config.rdApiToken, hashes);
-    const torrentMap = new Map(torrents.map((t) => [t.hash, t]));
+    const torrentMap = new Map(uniqueTorrents.map((t) => [t.hash, t]));
     const streams = [];
 
     for (const hash of hashes) {

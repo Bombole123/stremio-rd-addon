@@ -26,6 +26,7 @@ db.exec(`
     );
     CREATE INDEX IF NOT EXISTS idx_torrents_imdb ON torrents(imdb_id);
     CREATE INDEX IF NOT EXISTS idx_torrents_updated ON torrents(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_torrents_imdb_updated ON torrents(imdb_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS video_hashes (
         cache_key TEXT PRIMARY KEY,
@@ -91,15 +92,19 @@ function saveTorrents(imdbId, torrents) {
 
 // Clean up old entries (older than 30 days)
 function cleanup() {
-    const cutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
+    const start = Date.now();
+    const cutoff = start - (30 * 24 * 60 * 60 * 1000);
     deleteOldStmt.run(cutoff);
     deleteOldHashes.run(cutoff);
     db.pragma('optimize');
+    console.log(`[torrentDb] cleanup completed in ${Date.now() - start}ms`);
 }
 
-// Run cleanup on startup and every 24 hours
-cleanup();
-setInterval(cleanup, 24 * 60 * 60 * 1000).unref();
+// Defer cleanup to next tick so it doesn't block module loading, then repeat every 24h
+setTimeout(() => {
+    cleanup();
+    setInterval(cleanup, 24 * 60 * 60 * 1000).unref();
+}, 0);
 
 function getVideoHash(cacheKey) {
     return selectVideoHash.get(cacheKey) || null;

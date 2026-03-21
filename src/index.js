@@ -39,6 +39,7 @@ setInterval(() => {
 async function resolveHash(rdToken, hash, type, season, episode) {
     // Check if hash already in user's RD library
     let torrentId = null;
+    let weAdded = false; // Track whether we added this magnet ourselves
     const existing = await rd.getAllTorrents(rdToken);
     for (const t of existing) {
         if (t.hash && t.hash.toLowerCase() === hash.toLowerCase()) {
@@ -54,71 +55,81 @@ async function resolveHash(rdToken, hash, type, season, episode) {
             throw new Error('Failed to add magnet');
         }
         torrentId = added.id;
+        weAdded = true;
     }
 
-    // Get torrent info
-    let info = await rd.getTorrentInfo(rdToken, torrentId, true);
+    try {
+        // Get torrent info
+        let info = await rd.getTorrentInfo(rdToken, torrentId, true);
 
-    // Select files if needed
-    if (info.status === 'waiting_files_selection') {
-        const videoFiles = (info.files || []).filter(f => VIDEO_EXTENSIONS.test(f.path));
-        if (videoFiles.length > 0) {
-            await rd.selectFiles(rdToken, torrentId, videoFiles.map(f => f.id).join(','));
-        } else {
-            await rd.selectFiles(rdToken, torrentId, 'all');
+        // Select files if needed
+        if (info.status === 'waiting_files_selection') {
+            const videoFiles = (info.files || []).filter(f => VIDEO_EXTENSIONS.test(f.path));
+            if (videoFiles.length > 0) {
+                await rd.selectFiles(rdToken, torrentId, videoFiles.map(f => f.id).join(','));
+            } else {
+                await rd.selectFiles(rdToken, torrentId, 'all');
+            }
+            info = await rd.getTorrentInfo(rdToken, torrentId, true);
         }
-        info = await rd.getTorrentInfo(rdToken, torrentId, true);
-    }
 
-    if (!info.links || info.links.length === 0) {
-        throw new Error('No links available');
-    }
-
-    // Map selected files to links
-    const selectedFiles = (info.files || [])
-        .filter(f => f.selected === 1)
-        .sort((a, b) => a.id - b.id);
-
-    let targetFiles = selectedFiles.filter(f => VIDEO_EXTENSIONS.test(f.path));
-
-    // For series: match the right episode
-    if (type === 'series' && season && episode) {
-        const s = parseInt(season, 10);
-        const e = parseInt(episode, 10);
-        const episodeFiles = targetFiles.filter(f => {
-            const ep = parseEpisodeFromPath(f.path);
-            return ep.season === s && ep.episode === e;
-        });
-        if (episodeFiles.length > 0) {
-            targetFiles = episodeFiles;
-        } else if (targetFiles.length > 1) {
-            // Season pack but no episode match — don't play wrong episode
-            throw new Error('Episode not found in season pack');
+        if (!info.links || info.links.length === 0) {
+            throw new Error('No links available');
         }
+
+        // Map selected files to links
+        const selectedFiles = (info.files || [])
+            .filter(f => f.selected === 1)
+            .sort((a, b) => a.id - b.id);
+
+        let targetFiles = selectedFiles.filter(f => VIDEO_EXTENSIONS.test(f.path));
+
+        // For series: match the right episode
+        if (type === 'series' && season && episode) {
+            const s = parseInt(season, 10);
+            const e = parseInt(episode, 10);
+            const episodeFiles = targetFiles.filter(f => {
+                const ep = parseEpisodeFromPath(f.path);
+                return ep.season === s && ep.episode === e;
+            });
+            if (episodeFiles.length > 0) {
+                targetFiles = episodeFiles;
+            } else if (targetFiles.length > 1) {
+                // Season pack but no episode match — don't play wrong episode
+                throw new Error('Episode not found in season pack');
+            }
+        }
+
+        if (targetFiles.length === 0) {
+            throw new Error('No matching video file found');
+        }
+
+        // Pick the largest video file
+        const targetFile = targetFiles.reduce((best, f) =>
+            (f.bytes || 0) > (best.bytes || 0) ? f : best
+        );
+
+        const linkIndex = selectedFiles.findIndex(f => f.id === targetFile.id);
+        if (linkIndex === -1 || linkIndex >= info.links.length) {
+            throw new Error('Could not map file to link');
+        }
+
+        // Unrestrict and return download URL
+        const unrestricted = await rd.unrestrictLink(rdToken, info.links[linkIndex]);
+        if (!unrestricted || !unrestricted.download) {
+            throw new Error('Failed to unrestrict link');
+        }
+
+        rd.markHashCached(hash);
+        return { url: unrestricted.download, fileSize: targetFile.bytes || 0 };
+    } catch (err) {
+        // Clean up torrents we added if resolve fails (e.g. episode not found in pack)
+        if (weAdded && torrentId) {
+            console.log(`[resolve] Cleaning up torrent ${torrentId} — ${err.message}`);
+            await rd.deleteTorrent(rdToken, torrentId).catch(() => {});
+        }
+        throw err;
     }
-
-    if (targetFiles.length === 0) {
-        throw new Error('No matching video file found');
-    }
-
-    // Pick the largest video file
-    const targetFile = targetFiles.reduce((best, f) =>
-        (f.bytes || 0) > (best.bytes || 0) ? f : best
-    );
-
-    const linkIndex = selectedFiles.findIndex(f => f.id === targetFile.id);
-    if (linkIndex === -1 || linkIndex >= info.links.length) {
-        throw new Error('Could not map file to link');
-    }
-
-    // Unrestrict and return download URL
-    const unrestricted = await rd.unrestrictLink(rdToken, info.links[linkIndex]);
-    if (!unrestricted || !unrestricted.download) {
-        throw new Error('Failed to unrestrict link');
-    }
-
-    rd.markHashCached(hash);
-    return { url: unrestricted.download, fileSize: targetFile.bytes || 0 };
 }
 
 // Resolve + redirect route — resolves and 302 redirects to RD CDN

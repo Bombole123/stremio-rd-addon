@@ -93,16 +93,13 @@ async function doFetch(endpoint, token, options = {}) {
 
     return fetch(url, {
         ...fetchOptions,
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(config.thresholds?.rdApiTimeout || 15000),
     });
 }
 
 function handleNonAuthErrors(res) {
     if (res.status === 403) {
         throw new Error('Forbidden/disabled endpoint');
-    }
-    if (res.status === 429) {
-        throw new Error('Real-Debrid rate limit exceeded. Try again shortly.');
     }
     if (!res.ok) {
         // Caller will read the body
@@ -112,35 +109,53 @@ function handleNonAuthErrors(res) {
 }
 
 async function apiRequest(endpoint, token, options = {}) {
-    let res = await doFetch(endpoint, token, options);
+    const maxRetries = config.thresholds?.rdMaxRetries || 3;
+    const baseDelay = config.thresholds?.rdRetryDelayMs || 1000;
+    let delay = baseDelay;
 
-    // On 401, attempt a transparent token refresh and retry once
-    if (res.status === 401) {
-        try {
-            const newToken = await tryRefreshToken();
-            res = await doFetch(endpoint, newToken, options);
-        } catch (_refreshErr) {
-            // Refresh failed — throw the original 401 error
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        let res = await doFetch(endpoint, token, options);
+
+        // On 401, attempt a transparent token refresh and retry once
+        if (res.status === 401) {
+            try {
+                const newToken = await tryRefreshToken();
+                res = await doFetch(endpoint, newToken, options);
+            } catch (_refreshErr) {
+                // Refresh failed — throw the original 401 error
+                throw new Error('Invalid or expired Real-Debrid API token');
+            }
+        }
+
+        if (res.status === 401) {
             throw new Error('Invalid or expired Real-Debrid API token');
         }
+
+        // On 429, retry with exponential backoff
+        if (res.status === 429) {
+            if (attempt < maxRetries) {
+                console.log(`[rd] Rate limited, retrying in ${delay}ms...`);
+                await new Promise(r => setTimeout(r, delay));
+                delay *= 2;
+                continue;
+            }
+            // All retries exhausted — throw the rate limit error
+            throw new Error('Real-Debrid rate limit exceeded. Try again shortly.');
+        }
+
+        handleNonAuthErrors(res);
+
+        if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`RD API error ${res.status}: ${text}`);
+        }
+
+        if (res.status === 204 || res.headers.get('content-length') === '0') {
+            return null;
+        }
+
+        return res.json();
     }
-
-    if (res.status === 401) {
-        throw new Error('Invalid or expired Real-Debrid API token');
-    }
-
-    handleNonAuthErrors(res);
-
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`RD API error ${res.status}: ${text}`);
-    }
-
-    if (res.status === 204 || res.headers.get('content-length') === '0') {
-        return null;
-    }
-
-    return res.json();
 }
 
 async function getUser(token) {
@@ -240,8 +255,9 @@ async function checkInstantAvailability(token, hashes) {
 
     if (toQuery.length === 0) return result;
 
-    // Step 2: Check cache by adding magnets to RD (limited to 10 hashes)
-    const limitedHashes = toQuery.slice(0, 10);
+    // Step 2: Check cache by adding magnets to RD
+    const magnetLimit = config.thresholds?.magnetCheckLimit || 10;
+    const limitedHashes = toQuery.slice(0, magnetLimit);
     console.log(`[rd] Checking ${limitedHashes.length} hash(es) via add-magnet...`);
     try {
         const addResult = await checkViaAddFallback(token, limitedHashes);
@@ -299,7 +315,7 @@ async function checkViaAddFallback(token, hashes) {
         result[hash] = { rd: [variant] };
 
         // Small delay between requests to stay under rate limits
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise(r => setTimeout(r, config.thresholds?.magnetCheckDelay || 300));
     }
 
     return result;

@@ -49,6 +49,16 @@ module.exports = {
         unrestrict: 30 * 60 * 1000,   // 30 minutes
         hashCache: 6 * 60 * 60 * 1000, // 6 hours — known-cached hashes
     },
+    thresholds: {
+        searchTimeout: 10000,        // ms — per-indexer fetch timeout
+        searchGlobalTimeout: 15000,  // ms — max total time for all searches
+        rdApiTimeout: 15000,         // ms — RD API request timeout
+        rdRetryDelayMs: 1000,        // ms — initial delay for RD retry backoff
+        rdMaxRetries: 3,             // max retries on 429/5xx
+        magnetCheckDelay: 300,       // ms — delay between add-magnet cache checks
+        magnetCheckLimit: 10,        // max hashes for add-magnet fallback
+        zileanSeedBoost: 50,         // synthetic seed count for Zilean results
+    },
     localConfigPath: LOCAL_CONFIG_PATH,
     loadLocalConfig,
     saveLocalConfig,
