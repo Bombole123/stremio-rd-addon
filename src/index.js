@@ -159,13 +159,18 @@ async function resolveHash(rdToken, hash, type, season, episode, imdbId) {
     }
 }
 
+// Track in-flight pre-resolves so seeks don't re-trigger them
+const preResolveInFlight = new Set();
+
 // Pre-resolve next episode in background for binge-watching (best-effort, silent on failure)
 async function preResolveNextEpisode(rdToken, hash, type, season, nextEpisode, imdbId, userId) {
-    try {
-        const cacheKey = `${userId || 'default'}:${hash}:${type}:${season}:${nextEpisode}`;
-        const cached = resolvedUrlCache.get(cacheKey);
-        if (cached && cached.expiry > Date.now()) return; // Already cached
+    const cacheKey = `${userId || 'default'}:${hash}:${type}:${season}:${nextEpisode}`;
+    const cached = resolvedUrlCache.get(cacheKey);
+    if (cached && cached.expiry > Date.now()) return; // Already cached
+    if (preResolveInFlight.has(cacheKey)) return; // Already in-flight
 
+    preResolveInFlight.add(cacheKey);
+    try {
         const result = await resolveHash(rdToken, hash, type, season, String(nextEpisode), imdbId);
         if (result) {
             resolvedUrlCache.set(cacheKey, { url: result.url, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
@@ -173,6 +178,8 @@ async function preResolveNextEpisode(rdToken, hash, type, season, nextEpisode, i
         }
     } catch (_err) {
         // Silent — pre-resolve is best-effort
+    } finally {
+        preResolveInFlight.delete(cacheKey);
     }
 }
 
@@ -194,10 +201,12 @@ async function handleResolve(req, res) {
     try {
         let downloadUrl;
         let fileSize = 0;
+        let fromCache = false;
         const cached = resolvedUrlCache.get(resolveKey);
         if (cached && cached.expiry > Date.now()) {
             downloadUrl = cached.url;
             fileSize = cached.fileSize || 0;
+            fromCache = true;
         } else {
             if (!pendingResolves.has(resolveKey)) {
                 const p = resolveHash(rdToken, hash, type, season, episode, imdbId);
@@ -223,8 +232,8 @@ async function handleResolve(req, res) {
                 .catch((err) => console.error('[resolve] OpenSub hash error:', err.message));
         }
 
-        // Pre-resolve next episode for binge-watching (fire-and-forget)
-        if (type === 'series' && season && episode) {
+        // Pre-resolve next episode only on first resolve, not on seeks (cache hits)
+        if (!fromCache && type === 'series' && season && episode) {
             const nextEp = parseInt(episode, 10) + 1;
             setImmediate(() => {
                 preResolveNextEpisode(rdToken, hash, type, season, nextEp, imdbId, userId);
