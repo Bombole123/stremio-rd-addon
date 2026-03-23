@@ -283,7 +283,7 @@ async function handleResolve(req, res) {
         }
 
         // 302 redirect — player connects directly to RD CDN
-        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.set('Cache-Control', 'private, max-age=2400');
         res.redirect(302, downloadUrl);
     } catch (err) {
         if (err.name === 'AbortError') return;
@@ -330,7 +330,7 @@ async function handleResolveHead(req, res) {
             }
         }
 
-        res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.set('Cache-Control', 'private, max-age=2400');
         res.redirect(302, downloadUrl);
     } catch (err) {
         if (!res.headersSent) res.status(502).end();
