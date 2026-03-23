@@ -230,10 +230,10 @@ async function streamHandlerCore(type, id, options = {}) {
         if (cachedHash) {
             hints.videoHash = cachedHash.video_hash;
             hints.videoSize = cachedHash.video_size;
-        } else if (torrent.size && type !== 'series') {
-            // Only use torrent size for movies — for series, torrent.size is the whole pack
-            hints.videoSize = torrent.size;
         }
+        // Don't set videoSize from torrent.size — it's the whole torrent, not the video file.
+        // Incorrect videoSize causes ExoPlayer audio desync. Only use the real file size
+        // from OpenSubtitles hash computation (cachedHash above).
 
         streams.push({
             url: resolveUrl,
