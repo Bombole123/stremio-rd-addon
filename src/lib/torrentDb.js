@@ -41,6 +41,12 @@ db.exec(`
         availability TEXT NOT NULL,
         cached_at INTEGER NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS season_packs (
+        cache_key TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        cached_at INTEGER NOT NULL
+    );
 `);
 
 // Prepared statements for performance
@@ -80,6 +86,15 @@ const upsertHashCache = db.prepare(`
 `);
 const deleteExpiredHashCache = db.prepare('DELETE FROM hash_cache WHERE cached_at < ?');
 
+// Season pack cache statements
+const SEASON_PACK_TTL = 4 * 60 * 60 * 1000; // 4 hours
+const selectSeasonPack = db.prepare('SELECT data, cached_at FROM season_packs WHERE cache_key = ?');
+const upsertSeasonPack = db.prepare(`
+    INSERT OR REPLACE INTO season_packs (cache_key, data, cached_at)
+    VALUES (?, ?, ?)
+`);
+const deleteExpiredSeasonPacks = db.prepare('DELETE FROM season_packs WHERE cached_at < ?');
+
 const insertMany = db.transaction((torrents, imdbId) => {
     const now = Date.now();
     for (const t of torrents) {
@@ -112,6 +127,7 @@ function cleanup() {
     deleteOldStmt.run(cutoff);
     deleteOldHashes.run(cutoff);
     cleanExpiredHashCache();
+    cleanExpiredSeasonPacks();
     db.pragma('optimize');
     console.log(`[torrentDb] cleanup completed in ${Date.now() - start}ms`);
 }
@@ -151,7 +167,27 @@ function cleanExpiredHashCache() {
     deleteExpiredHashCache.run(Date.now() - ttl);
 }
 
+function getCachedSeasonPack(key) {
+    const row = selectSeasonPack.get(key);
+    if (!row) return null;
+    if (Date.now() - row.cached_at > SEASON_PACK_TTL) return null;
+    try {
+        return JSON.parse(row.data);
+    } catch {
+        return null;
+    }
+}
+
+function setCachedSeasonPack(key, data) {
+    upsertSeasonPack.run(key, JSON.stringify(data), Date.now());
+}
+
+function cleanExpiredSeasonPacks() {
+    deleteExpiredSeasonPacks.run(Date.now() - SEASON_PACK_TTL);
+}
+
 module.exports = {
     getTorrents, isFresh, saveTorrents, getVideoHash, setVideoHash,
     getCachedAvailability, setCachedAvailability, cleanExpiredHashCache,
+    getCachedSeasonPack, setCachedSeasonPack,
 };

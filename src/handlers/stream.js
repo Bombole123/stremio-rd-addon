@@ -7,6 +7,9 @@ const { searchTorrents } = require('../lib/torrentSearch');
 const { getVideoHash } = require('../lib/torrentDb');
 const { getCachedPack } = require('../lib/seasonPackCache');
 
+// Single-flight deduplication for concurrent stream requests
+const pendingStreams = new Map();
+
 function buildMultiCriteriaComparator(sortPriority) {
     const priority = sortPriority || ['quality', 'language', 'size', 'seeders', 'codec', 'source'];
     const qualityRank = { '2160p': 4, '1080p': 3, '720p': 2, '480p': 1 };
@@ -57,7 +60,7 @@ function buildMultiCriteriaComparator(sortPriority) {
     };
 }
 
-async function streamHandler(type, id, options = {}) {
+async function streamHandlerCore(type, id, options = {}) {
     const startTime = Date.now();
     const rdToken = options.rdToken || config.rdApiToken;
     const userId = options.userId || null;
@@ -334,6 +337,22 @@ async function streamHandler(type, id, options = {}) {
     console.log(`[stream] ${type}/${imdbId} | ${metaMs}ms meta | ${searchMs}ms search (${uniqueTorrents.length} torrents) | ${cacheMs}ms cache | ${streams.length} streams | ${Date.now() - startTime}ms total`);
 
     return { streams: cleaned };
+}
+
+async function streamHandler(type, id, options = {}) {
+    const userId = options.userId || 'default';
+    const dedupKey = `${userId}:${type}:${id}`;
+
+    if (pendingStreams.has(dedupKey)) {
+        console.log(`[stream] Dedup hit for ${dedupKey}`);
+        return pendingStreams.get(dedupKey);
+    }
+
+    const promise = streamHandlerCore(type, id, options);
+    pendingStreams.set(dedupKey, promise);
+    promise.finally(() => pendingStreams.delete(dedupKey));
+
+    return promise;
 }
 
 module.exports = streamHandler;

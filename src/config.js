@@ -57,7 +57,6 @@ module.exports = {
         rdApiTimeout: 15000,         // ms — RD API request timeout
         rdRetryDelayMs: 1000,        // ms — initial delay for RD retry backoff
         rdMaxRetries: 3,             // max retries on 429/5xx
-        magnetCheckDelay: 300,       // ms — delay between add-magnet cache checks
         magnetCheckLimit: 10,        // max hashes for add-magnet fallback
         magnetConcurrency: 3,        // parallel add-magnet checks at once
         maxPerTierCheck: 3,          // max hashes to check per quality tier

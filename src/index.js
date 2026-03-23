@@ -36,26 +36,23 @@ const pendingResolves = new Map();
 const resolvedUrlCache = new Map();
 const RESOLVE_CACHE_TTL = 20 * 60 * 1000; // 20 minutes — RD links expire after ~30-60 min
 
-// Clean up expired entries every 30 minutes
+// Clean up expired entries — interval matches TTL so no entry lingers longer than one extra cycle
 setInterval(() => {
     const now = Date.now();
     for (const [key, value] of resolvedUrlCache) {
         if (value.expiry < now) resolvedUrlCache.delete(key);
     }
-}, 30 * 60 * 1000);
+}, RESOLVE_CACHE_TTL).unref();
 
 // Core resolve logic — returns the download URL string or throws
 async function resolveHash(rdToken, hash, type, season, episode, imdbId) {
     const startTime = Date.now();
-    // Check if hash already in user's RD library
+    // Check if hash already in user's RD library via indexed lookup
     let torrentId = null;
     let weAdded = false; // Track whether we added this magnet ourselves
-    const existing = await rd.getAllTorrents(rdToken);
-    for (const t of existing) {
-        if (t.hash && t.hash.toLowerCase() === hash.toLowerCase()) {
-            torrentId = t.id;
-            break;
-        }
+    const existing = await rd.findTorrentByHash(rdToken, hash);
+    if (existing) {
+        torrentId = existing.id;
     }
 
     // Add magnet if not found
@@ -1243,6 +1240,17 @@ const server = app.listen(config.port, '0.0.0.0', () => {
         }
     }
     console.log('');
+
+    // Warm hash cache from RD library (non-blocking, fire-and-forget)
+    if (config.rdApiToken) {
+        rd.warmHashCache(config.rdApiToken).catch(() => {});
+    }
+    for (const u of users) {
+        const user = userStore.getUser(u.userId);
+        if (user && user.rdApiToken) {
+            rd.warmHashCache(user.rdApiToken).catch(() => {});
+        }
+    }
 });
 
 server.on('error', (err) => {

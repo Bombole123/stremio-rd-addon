@@ -3,14 +3,83 @@ const Cache = require('./cache');
 const userStore = require('./userStore');
 const { getCachedAvailability, setCachedAvailability } = require('./torrentDb');
 
+const ERR_RATE_LIMITED = 'Real-Debrid rate limit exceeded. Try again shortly.';
+
 const cache = new Cache();
 
 // In-memory negative cache of hashes known NOT to be cached on RD (6-hour TTL)
 const hashCache = new Cache();
 
+// --- Library index: in-memory hash→torrent mapping to avoid paginating getAllTorrents() every resolve ---
+const LIBRARY_REFRESH_INTERVAL = 2 * 60 * 1000; // 2 minutes
+
+// Per-token library index: tokenKey → { index: Map<hash, {id, status, filename}>, lastRefresh, refreshPromise }
+const libraryIndexes = new Map();
+
 // Use last 8 chars of token as cache key fingerprint
 function tokenKey(token) {
     return token.slice(-8);
+}
+
+// --- Library index functions ---
+
+function getLibraryEntry(token) {
+    const key = tokenKey(token);
+    if (!libraryIndexes.has(key)) {
+        libraryIndexes.set(key, { index: new Map(), lastRefresh: 0, refreshPromise: null });
+    }
+    return libraryIndexes.get(key);
+}
+
+async function refreshLibraryIndex(token, force = false) {
+    const entry = getLibraryEntry(token);
+    const now = Date.now();
+
+    // Skip if recently refreshed and not forced
+    if (!force && (now - entry.lastRefresh) < LIBRARY_REFRESH_INTERVAL) {
+        return entry.index;
+    }
+
+    // Deduplicate concurrent refreshes
+    if (entry.refreshPromise) return entry.refreshPromise;
+
+    entry.refreshPromise = (async () => {
+        try {
+            const torrents = await getAllTorrents(token);
+            const newIndex = new Map();
+            for (const t of torrents) {
+                if (t.hash) {
+                    newIndex.set(t.hash.toLowerCase(), {
+                        id: t.id,
+                        status: t.status,
+                        filename: t.filename || '',
+                    });
+                }
+            }
+            entry.index = newIndex;
+            entry.lastRefresh = Date.now();
+            console.log(`[rd] Library index refreshed: ${newIndex.size} torrents`);
+            return newIndex;
+        } finally {
+            entry.refreshPromise = null;
+        }
+    })();
+
+    return entry.refreshPromise;
+}
+
+async function findTorrentByHash(token, hash) {
+    const normalizedHash = hash.toLowerCase();
+    const entry = getLibraryEntry(token);
+
+    // Check index first
+    if (entry.index.has(normalizedHash)) {
+        return entry.index.get(normalizedHash);
+    }
+
+    // Miss — refresh and check again
+    const freshIndex = await refreshLibraryIndex(token, true);
+    return freshIndex.get(normalizedHash) || null;
 }
 
 // --- Token refresh logic ---
@@ -101,6 +170,8 @@ async function tryRefreshToken(userId) {
 }
 
 // --- Core API request with automatic 401 retry ---
+// Note: HTTP keep-alive is enabled by default in Node 19+ (both http/https agents
+// and native fetch/undici use persistent connections). No custom agent needed.
 
 async function doFetch(endpoint, token, options = {}) {
     const url = `${config.rdApiBase}${endpoint}`;
@@ -169,7 +240,7 @@ async function apiRequest(endpoint, token, options = {}) {
                 continue;
             }
             // All retries exhausted — throw the rate limit error
-            throw new Error('Real-Debrid rate limit exceeded. Try again shortly.');
+            throw new Error(ERR_RATE_LIMITED);
         }
 
         handleNonAuthErrors(res);
@@ -454,7 +525,7 @@ async function checkCacheViaAdd(token, hash) {
         await deleteTorrent(token, torrentId).catch(() => {});
         return null;
     } catch (err) {
-        if (err.message && err.message.includes('rate limit')) {
+        if (err.message === ERR_RATE_LIMITED) {
             if (torrentId) await deleteTorrent(token, torrentId).catch(() => {});
             return 'rate_limited';
         }
@@ -488,6 +559,32 @@ function clearCache() {
     cache.clear();
 }
 
+// Warm the hash cache and library index from the user's RD torrent library on startup.
+// Uses refreshLibraryIndex as the single authoritative path for building the index, then
+// walks the resulting index to populate the SQLite availability cache for downloaded torrents.
+async function warmHashCache(token) {
+    try {
+        // Force a full refresh so the index is populated before the first resolve request.
+        // refreshLibraryIndex owns all writes to entry.index / entry.lastRefresh, which
+        // prevents a race with any concurrent findTorrentByHash call.
+        const index = await refreshLibraryIndex(token, true);
+        let warmed = 0;
+
+        for (const [hash, t] of index) {
+            if (t.status === 'downloaded') {
+                const availability = { rd: [{ 1: { filename: t.filename || 'cached', filesize: 0 } }] };
+                setCachedAvailability(hash, availability);
+                markHashCached(hash);
+                warmed++;
+            }
+        }
+
+        console.log(`[rd] Warmed hash cache with ${warmed} downloaded torrents (${index.size} total in library index)`);
+    } catch (err) {
+        console.error('[rd] Failed to warm hash cache:', err.message);
+    }
+}
+
 module.exports = {
     getUser,
     getTorrents,
@@ -504,4 +601,7 @@ module.exports = {
     markHashCached,
     markHashNotCached,
     isHashKnownNotCached,
+    refreshLibraryIndex,
+    findTorrentByHash,
+    warmHashCache,
 };
