@@ -1406,12 +1406,10 @@ const server = app.listen(config.port, '0.0.0.0', () => {
         }
     }
 
-    // Scheduled library cleanup (if configured)
+    // Scheduled library cleanup at 4am EST (9:00 UTC) daily
     if (config.autoCleanupDays > 0) {
-        const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
-        console.log(`[cleanup] Auto-cleanup enabled: removing torrents older than ${config.autoCleanupDays} day(s) every 24h`);
-
         async function runScheduledCleanup() {
+            console.log(`[cleanup] Running scheduled cleanup: removing torrents older than ${config.autoCleanupDays} day(s)`);
             const tokens = [];
             if (config.rdApiToken) tokens.push({ label: 'legacy', token: config.rdApiToken });
             for (const u of userStore.listUsers()) {
@@ -1424,14 +1422,26 @@ const server = app.listen(config.port, '0.0.0.0', () => {
             for (const { label, token } of tokens) {
                 try {
                     const result = await rd.cleanupLibrary(token, { maxAgeDays: config.autoCleanupDays });
-                    console.log(`[cleanup] Scheduled cleanup for ${label}: deleted ${result.deleted}, skipped ${result.skipped}, errors ${result.errors}`);
+                    console.log(`[cleanup] ${label}: deleted ${result.deleted}, skipped ${result.skipped}, errors ${result.errors}`);
                 } catch (err) {
-                    console.error(`[cleanup] Scheduled cleanup failed for ${label}:`, err.message);
+                    console.error(`[cleanup] Failed for ${label}:`, err.message);
                 }
             }
         }
 
-        setInterval(runScheduledCleanup, CLEANUP_INTERVAL).unref();
+        function scheduleNextCleanup() {
+            const now = new Date();
+            const next = new Date(now);
+            next.setUTCHours(9, 0, 0, 0); // 9:00 UTC = 4:00 AM EST
+            if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+            const ms = next - now;
+            console.log(`[cleanup] Auto-cleanup enabled (${config.autoCleanupDays} day retention). Next run: ${next.toISOString()}`);
+            setTimeout(() => {
+                runScheduledCleanup().finally(scheduleNextCleanup);
+            }, ms).unref();
+        }
+
+        scheduleNextCleanup();
     }
 });
 
