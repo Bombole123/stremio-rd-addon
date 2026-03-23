@@ -913,6 +913,29 @@ app.post('/api/save-config', async (req, res) => {
     res.json({ success: true, username, userId });
 });
 
+// --- API: Library cleanup ---
+
+app.post('/api/cleanup', async (req, res) => {
+    const rdToken = config.rdApiToken;
+    if (!rdToken) {
+        return res.status(503).json({ error: 'No Real-Debrid token configured' });
+    }
+
+    const { maxAgeDays, dryRun } = req.body || {};
+    const parsedDays = parseInt(maxAgeDays, 10);
+    const resolvedDays = (!isNaN(parsedDays) && parsedDays >= 1) ? parsedDays : 7;
+    try {
+        const result = await rd.cleanupLibrary(rdToken, {
+            maxAgeDays: resolvedDays,
+            dryRun: !!dryRun,
+        });
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[cleanup] Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- Device Code OAuth Flow ---
 const RD_OAUTH_CLIENT_ID = 'X245A4XAIBGVM';
 
@@ -1097,7 +1120,7 @@ async function getCachedUserInfo() {
 }
 
 function buildStatusHtml(data) {
-    const esc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const esc = escHtml;
     const badge = (ok) => ok
         ? '<span style="color:#4caf50;font-weight:600;">Yes</span>'
         : '<span style="color:#f44336;font-weight:600;">No</span>';
@@ -1171,6 +1194,58 @@ function buildStatusHtml(data) {
         <tr><td>Hash Cache</td><td>${badge(data.cache.hashCacheConfigured)}</td></tr>
         <tr><td>DB Path</td><td style="font-family:monospace;font-size:13px;">${esc(data.cache.dbPath)}</td></tr>
     </table>
+
+    <h2>Library Cleanup</h2>
+    <div style="background:#111;padding:16px;border-radius:6px;">
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+            <label style="color:#999;font-size:13px;">Max age (days):</label>
+            <input type="number" id="cleanupDays" value="7" min="1" max="365" style="width:70px;padding:6px 8px;background:#0d0d1a;border:1px solid #333;border-radius:4px;color:#fff;font-size:14px;">
+            <label style="display:flex;align-items:center;gap:6px;color:#999;font-size:13px;cursor:pointer;">
+                <input type="checkbox" id="cleanupDryRun" checked> Dry run
+            </label>
+        </div>
+        <button onclick="runCleanup()" id="cleanupBtn" style="padding:10px 20px;background:#f44336;color:#fff;border:none;border-radius:4px;font-size:14px;font-weight:600;cursor:pointer;">Run Cleanup</button>
+        <div id="cleanupResult" style="margin-top:12px;font-size:13px;color:#999;display:none;"></div>
+    </div>
+    <script>
+        function runCleanup() {
+            var btn = document.getElementById('cleanupBtn');
+            var result = document.getElementById('cleanupResult');
+            var days = parseInt(document.getElementById('cleanupDays').value, 10) || 7;
+            var dryRun = document.getElementById('cleanupDryRun').checked;
+
+            btn.disabled = true;
+            btn.textContent = 'Running...';
+            result.style.display = 'block';
+            result.style.color = '#999';
+            result.textContent = (dryRun ? 'Dry run' : 'Cleanup') + ' in progress...';
+
+            fetch('/api/cleanup', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ maxAgeDays: days, dryRun: dryRun })
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                btn.disabled = false;
+                btn.textContent = 'Run Cleanup';
+                if (data.error) {
+                    result.style.color = '#f44336';
+                    result.textContent = 'Error: ' + data.error;
+                } else {
+                    result.style.color = '#4caf50';
+                    var prefix = dryRun ? 'Would delete' : 'Deleted';
+                    result.textContent = prefix + ' ' + data.deleted + ' torrent(s). Skipped: ' + data.skipped + '. Errors: ' + data.errors + '.';
+                }
+            })
+            .catch(function() {
+                btn.disabled = false;
+                btn.textContent = 'Run Cleanup';
+                result.style.color = '#f44336';
+                result.textContent = 'Network error.';
+            });
+        }
+    </script>
 </body>
 </html>`;
 }
@@ -1283,6 +1358,22 @@ userRouter.get('/stream/:type/:id.json', async (req, res) => {
 userRouter.get('/resolve/:hash', handleResolve);
 userRouter.head('/resolve/:hash', handleResolveHead);
 
+userRouter.post('/api/cleanup', async (req, res) => {
+    const { maxAgeDays, dryRun } = req.body || {};
+    const parsedDays = parseInt(maxAgeDays, 10);
+    const resolvedDays = (!isNaN(parsedDays) && parsedDays >= 1) ? parsedDays : 7;
+    try {
+        const result = await rd.cleanupLibrary(req.rdToken, {
+            maxAgeDays: resolvedDays,
+            dryRun: !!dryRun,
+        });
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[cleanup] Error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.use('/:userId', userRouter);
 
 // Start server on all interfaces so other devices on the network can reach it
@@ -1313,6 +1404,34 @@ const server = app.listen(config.port, '0.0.0.0', () => {
         if (user && user.rdApiToken) {
             rd.warmHashCache(user.rdApiToken).catch(() => {});
         }
+    }
+
+    // Scheduled library cleanup (if configured)
+    if (config.autoCleanupDays > 0) {
+        const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+        console.log(`[cleanup] Auto-cleanup enabled: removing torrents older than ${config.autoCleanupDays} day(s) every 24h`);
+
+        async function runScheduledCleanup() {
+            const tokens = [];
+            if (config.rdApiToken) tokens.push({ label: 'legacy', token: config.rdApiToken });
+            for (const u of userStore.listUsers()) {
+                const user = userStore.getUser(u.userId);
+                if (user && user.rdApiToken) {
+                    tokens.push({ label: u.username || u.userId.slice(0, 8), token: user.rdApiToken });
+                }
+            }
+
+            for (const { label, token } of tokens) {
+                try {
+                    const result = await rd.cleanupLibrary(token, { maxAgeDays: config.autoCleanupDays });
+                    console.log(`[cleanup] Scheduled cleanup for ${label}: deleted ${result.deleted}, skipped ${result.skipped}, errors ${result.errors}`);
+                } catch (err) {
+                    console.error(`[cleanup] Scheduled cleanup failed for ${label}:`, err.message);
+                }
+            }
+        }
+
+        setInterval(runScheduledCleanup, CLEANUP_INTERVAL).unref();
     }
 });
 

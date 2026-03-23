@@ -63,6 +63,7 @@ module.exports = {
         minResultsPerTier: 2,        // stop early once we have this many per tier
         zileanSeedBoost: 50,         // synthetic seed count for Zilean results
     },
+    autoCleanupDays: parseInt(process.env.AUTO_CLEANUP_DAYS, 10) || localConfig.autoCleanupDays || 0,
     localConfigPath: LOCAL_CONFIG_PATH,
     loadLocalConfig,
     saveLocalConfig,

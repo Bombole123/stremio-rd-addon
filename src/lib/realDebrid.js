@@ -559,6 +559,83 @@ function clearCache() {
     cache.clear();
 }
 
+// Fetch all torrents bypassing the in-memory cache (for cleanup, which needs fresh data)
+async function getAllTorrentsFresh(token) {
+    let allTorrents = [];
+    let page = 1;
+    while (true) {
+        const batch = await apiRequest(`/torrents?page=${page}&limit=50`, token);
+        if (!batch || batch.length === 0) break;
+        allTorrents = allTorrents.concat(batch);
+        if (batch.length < 50) break;
+        page++;
+        if (page > 50) break;
+    }
+    return allTorrents;
+}
+
+async function cleanupLibrary(token, options = {}) {
+    const maxAgeDays = options.maxAgeDays != null ? options.maxAgeDays : 7;
+    const keepActive = options.keepActive != null ? options.keepActive : true;
+    const dryRun = options.dryRun || false;
+
+    const cutoff = Date.now() - (maxAgeDays * 24 * 60 * 60 * 1000);
+
+    // Use fresh data — never cached — so we don't delete stale entries
+    const torrents = await getAllTorrentsFresh(token);
+
+    let deleted = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const torrent of torrents) {
+        const addedTime = new Date(torrent.added).getTime();
+
+        if (isNaN(addedTime)) {
+            console.warn(`[rd] Cleanup: skipping torrent ${torrent.id} — unparseable added date: ${torrent.added}`);
+            skipped++;
+            continue;
+        }
+
+        // Skip torrents newer than the cutoff
+        if (addedTime > cutoff) {
+            skipped++;
+            continue;
+        }
+
+        // If keepActive, only delete torrents with status "downloaded"
+        if (keepActive && torrent.status !== 'downloaded') {
+            skipped++;
+            continue;
+        }
+
+        if (dryRun) {
+            deleted++;
+            continue;
+        }
+
+        try {
+            await deleteTorrent(token, torrent.id);
+            deleted++;
+            // Delay between deletions to stay within RD write rate limits (~1 req/s)
+            await new Promise(r => setTimeout(r, 250));
+        } catch (err) {
+            console.error(`[rd] Cleanup: failed to delete torrent ${torrent.id}: ${err.message}`);
+            errors++;
+        }
+    }
+
+    const mode = dryRun ? 'DRY RUN' : 'deleted';
+    console.log(`[rd] Library cleanup: ${mode} ${deleted} torrents (${skipped} skipped, ${errors} errors)`);
+
+    // Force refresh the library index after cleanup so it reflects the deletions
+    if (!dryRun && deleted > 0) {
+        refreshLibraryIndex(token, true).catch(() => {});
+    }
+
+    return { deleted, skipped, errors };
+}
+
 // Warm the hash cache and library index from the user's RD torrent library on startup.
 // Uses refreshLibraryIndex as the single authoritative path for building the index, then
 // walks the resulting index to populate the SQLite availability cache for downloaded torrents.
@@ -598,6 +675,7 @@ module.exports = {
     selectFiles,
     deleteTorrent,
     clearCache,
+    cleanupLibrary,
     markHashCached,
     markHashNotCached,
     isHashKnownNotCached,
