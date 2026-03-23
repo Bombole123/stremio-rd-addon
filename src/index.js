@@ -34,7 +34,7 @@ const pendingResolves = new Map();
 // Cache resolved download URLs — avoids re-unrestricting on repeated requests from same playback
 // Key: resolveKey, Value: { url, expiry }
 const resolvedUrlCache = new Map();
-const RESOLVE_CACHE_TTL = 20 * 60 * 1000; // 20 minutes — RD links expire after ~30-60 min
+const RESOLVE_CACHE_TTL = 40 * 60 * 1000; // 40 minutes — RD links expire after ~60 min
 
 // Clean up expired entries — interval matches TTL so no entry lingers longer than one extra cycle
 setInterval(() => {
@@ -156,8 +156,9 @@ async function resolveHash(rdToken, hash, type, season, episode, imdbId) {
     }
 }
 
-// Track in-flight pre-resolves so seeks don't re-trigger them
-const preResolveInFlight = new Set();
+// Track in-flight pre-resolves: key → Promise. Allows handleResolve to join an existing
+// pre-resolve rather than launching a duplicate RD API call for the same hash.
+const preResolveInFlight = new Map();
 
 // Pre-resolve next episode in background for binge-watching (best-effort, silent on failure)
 async function preResolveNextEpisode(rdToken, hash, type, season, nextEpisode, imdbId, userId) {
@@ -166,17 +167,48 @@ async function preResolveNextEpisode(rdToken, hash, type, season, nextEpisode, i
     if (cached && cached.expiry > Date.now()) return; // Already cached
     if (preResolveInFlight.has(cacheKey)) return; // Already in-flight
 
-    preResolveInFlight.add(cacheKey);
-    try {
-        const result = await resolveHash(rdToken, hash, type, season, String(nextEpisode), imdbId);
-        if (result) {
+    const p = resolveHash(rdToken, hash, type, season, String(nextEpisode), imdbId)
+        .then(result => {
             resolvedUrlCache.set(cacheKey, { url: result.url, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
             console.log(`[resolve] Pre-resolved next episode S${season}E${nextEpisode}`);
-        }
-    } catch (_err) {
-        // Silent — pre-resolve is best-effort
-    } finally {
-        preResolveInFlight.delete(cacheKey);
+        })
+        .catch(() => {}) // Silent — pre-resolve is best-effort
+        .finally(() => preResolveInFlight.delete(cacheKey));
+    preResolveInFlight.set(cacheKey, p);
+}
+
+// Pre-resolve top streams after listing so the CDN URL is cached when the user clicks
+function preResolveTopStreams(rdToken, streams, userId) {
+    const top = streams.slice(0, 3);
+    for (const stream of top) {
+        try {
+            const parsed = new URL(stream.url);
+            const pathParts = parsed.pathname.split('/resolve/');
+            if (pathParts.length < 2) continue;
+            const hash = pathParts[1];
+            if (!hash) continue;
+            const type = parsed.searchParams.get('type') || '';
+            const season = parsed.searchParams.get('season') || '';
+            const episode = parsed.searchParams.get('episode') || '';
+            const imdbId = parsed.searchParams.get('imdbId') || '';
+
+            const resolveKey = `${userId || 'default'}:${hash}:${type}:${season}:${episode}`;
+            const cached = resolvedUrlCache.get(resolveKey);
+            if (cached && cached.expiry > Date.now()) continue; // Already cached
+            if (pendingResolves.has(resolveKey)) continue; // Real request already in-flight
+            if (preResolveInFlight.has(resolveKey)) continue; // Pre-resolve already in-flight
+
+            // Store promise in preResolveInFlight only — handleResolve will join it from there
+            // if a real request arrives before this finishes, avoiding a duplicate RD API call.
+            const p = resolveHash(rdToken, hash, type, season || undefined, episode || undefined, imdbId || undefined)
+                .then(result => {
+                    resolvedUrlCache.set(resolveKey, { url: result.url, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
+                    console.log(`[resolve] Pre-resolved top stream ${hash.slice(0, 8)}...`);
+                })
+                .catch(() => {}) // Silent — pre-resolve is best-effort
+                .finally(() => preResolveInFlight.delete(resolveKey));
+            preResolveInFlight.set(resolveKey, p);
+        } catch (_) {}
     }
 }
 
@@ -205,15 +237,28 @@ async function handleResolve(req, res) {
             fileSize = cached.fileSize || 0;
             fromCache = true;
         } else {
-            if (!pendingResolves.has(resolveKey)) {
-                const p = resolveHash(rdToken, hash, type, season, episode, imdbId);
-                p.finally(() => pendingResolves.delete(resolveKey));
-                pendingResolves.set(resolveKey, p);
+            // Join an in-flight pre-resolve if one exists — avoids a duplicate RD API call.
+            // The pre-resolve promise populates resolvedUrlCache on success; we read from cache after.
+            if (preResolveInFlight.has(resolveKey)) {
+                await preResolveInFlight.get(resolveKey).catch(() => {});
+                const hit = resolvedUrlCache.get(resolveKey);
+                if (hit && hit.expiry > Date.now()) {
+                    downloadUrl = hit.url;
+                    fileSize = hit.fileSize || 0;
+                    // fromCache stays false so next-episode pre-resolve still fires
+                }
             }
-            const result = await pendingResolves.get(resolveKey);
-            downloadUrl = result.url;
-            fileSize = result.fileSize || 0;
-            resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            if (!downloadUrl) {
+                if (!pendingResolves.has(resolveKey)) {
+                    const p = resolveHash(rdToken, hash, type, season, episode, imdbId);
+                    p.finally(() => pendingResolves.delete(resolveKey));
+                    pendingResolves.set(resolveKey, p);
+                }
+                const result = await pendingResolves.get(resolveKey);
+                downloadUrl = result.url;
+                fileSize = result.fileSize || 0;
+                resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            }
         }
 
         // Compute OpenSubtitles hash in background (for behaviorHints on next listing)
@@ -265,14 +310,24 @@ async function handleResolveHead(req, res) {
         if (cached && cached.expiry > Date.now()) {
             downloadUrl = cached.url;
         } else {
-            if (!pendingResolves.has(resolveKey)) {
-                const p = resolveHash(rdToken, hash, type, season, episode, imdbId);
-                p.finally(() => pendingResolves.delete(resolveKey));
-                pendingResolves.set(resolveKey, p);
+            // Join an in-flight pre-resolve if one exists — avoids a duplicate RD API call.
+            if (preResolveInFlight.has(resolveKey)) {
+                await preResolveInFlight.get(resolveKey).catch(() => {});
+                const hit = resolvedUrlCache.get(resolveKey);
+                if (hit && hit.expiry > Date.now()) {
+                    downloadUrl = hit.url;
+                }
             }
-            const result = await pendingResolves.get(resolveKey);
-            downloadUrl = result.url;
-            resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            if (!downloadUrl) {
+                if (!pendingResolves.has(resolveKey)) {
+                    const p = resolveHash(rdToken, hash, type, season, episode, imdbId);
+                    p.finally(() => pendingResolves.delete(resolveKey));
+                    pendingResolves.set(resolveKey, p);
+                }
+                const result = await pendingResolves.get(resolveKey);
+                downloadUrl = result.url;
+                resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            }
         }
 
         res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
@@ -1172,6 +1227,10 @@ app.get('/stream/:type/:id.json', defaultTokenMiddleware, async (req, res) => {
             userId: req.userId,
         });
         res.json(result);
+        // Pre-resolve top streams in background so clicking is instant
+        if (result.streams && result.streams.length > 0) {
+            setImmediate(() => preResolveTopStreams(req.rdToken, result.streams, req.userId));
+        }
     } catch (err) {
         console.error('Stream error:', err.message, err.stack);
         res.json({ streams: [] });
@@ -1211,6 +1270,10 @@ userRouter.get('/stream/:type/:id.json', async (req, res) => {
             userId: req.userId,
         });
         res.json(result);
+        // Pre-resolve top streams in background so clicking is instant
+        if (result.streams && result.streams.length > 0) {
+            setImmediate(() => preResolveTopStreams(req.rdToken, result.streams, req.userId));
+        }
     } catch (err) {
         console.error('Stream error:', err.message, err.stack);
         res.json({ streams: [] });
