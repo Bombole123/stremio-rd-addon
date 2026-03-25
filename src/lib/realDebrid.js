@@ -315,10 +315,12 @@ async function getDownloads(token, page = 1, limit = 50) {
     return result;
 }
 
-async function unrestrictLink(token, link) {
+async function unrestrictLink(token, link, options = {}) {
     const cacheKey = `unrestrict:${link}`;
-    const cached = cache.get(cacheKey);
-    if (cached) return cached;
+    if (!options.force) {
+        const cached = cache.get(cacheKey);
+        if (cached) return cached;
+    }
 
     const result = await apiRequest('/unrestrict/link', token, {
         method: 'POST',

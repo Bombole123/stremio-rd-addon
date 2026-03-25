@@ -11,6 +11,7 @@ const { computeOpenSubHash } = require('./lib/opensubHash');
 const { getVideoHash, setVideoHash } = require('./lib/torrentDb');
 const { sourceStats } = require('./lib/torrentSearch');
 const { setCachedPack } = require('./lib/seasonPackCache');
+const { proxyStream } = require('./lib/streamProxy');
 
 const app = express();
 app.use(cors());
@@ -122,7 +123,8 @@ async function resolveHash(rdToken, hash, type, season, episode, imdbId) {
         }
 
         // Unrestrict and return download URL
-        const unrestricted = await rd.unrestrictLink(rdToken, info.links[linkIndex]);
+        const rdLink = info.links[linkIndex];
+        const unrestricted = await rd.unrestrictLink(rdToken, rdLink);
         if (!unrestricted || !unrestricted.download) {
             throw new Error('Failed to unrestrict link');
         }
@@ -145,7 +147,7 @@ async function resolveHash(rdToken, hash, type, season, episode, imdbId) {
             }
         }
 
-        return { url: unrestricted.download, fileSize: targetFile.bytes || 0 };
+        return { url: unrestricted.download, fileSize: targetFile.bytes || 0, rdLink };
     } catch (err) {
         // Clean up torrents we added if resolve fails (e.g. episode not found in pack)
         if (weAdded && torrentId) {
@@ -169,7 +171,7 @@ async function preResolveNextEpisode(rdToken, hash, type, season, nextEpisode, i
 
     const p = resolveHash(rdToken, hash, type, season, String(nextEpisode), imdbId)
         .then(result => {
-            resolvedUrlCache.set(cacheKey, { url: result.url, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            resolvedUrlCache.set(cacheKey, { url: result.url, fileSize: result.fileSize || 0, rdLink: result.rdLink, expiry: Date.now() + RESOLVE_CACHE_TTL });
             console.log(`[resolve] Pre-resolved next episode S${season}E${nextEpisode}`);
         })
         .catch(() => {}) // Silent — pre-resolve is best-effort
@@ -202,7 +204,7 @@ function preResolveTopStreams(rdToken, streams, userId) {
             // if a real request arrives before this finishes, avoiding a duplicate RD API call.
             const p = resolveHash(rdToken, hash, type, season || undefined, episode || undefined, imdbId || undefined)
                 .then(result => {
-                    resolvedUrlCache.set(resolveKey, { url: result.url, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
+                    resolvedUrlCache.set(resolveKey, { url: result.url, fileSize: result.fileSize || 0, rdLink: result.rdLink, expiry: Date.now() + RESOLVE_CACHE_TTL });
                     console.log(`[resolve] Pre-resolved top stream ${hash.slice(0, 8)}...`);
                 })
                 .catch(() => {}) // Silent — pre-resolve is best-effort
@@ -230,11 +232,13 @@ async function handleResolve(req, res) {
     try {
         let downloadUrl;
         let fileSize = 0;
+        let rdLink = null;
         let fromCache = false;
         const cached = resolvedUrlCache.get(resolveKey);
         if (cached && cached.expiry > Date.now()) {
             downloadUrl = cached.url;
             fileSize = cached.fileSize || 0;
+            rdLink = cached.rdLink || null;
             fromCache = true;
         } else {
             // Join an in-flight pre-resolve if one exists — avoids a duplicate RD API call.
@@ -245,6 +249,7 @@ async function handleResolve(req, res) {
                 if (hit && hit.expiry > Date.now()) {
                     downloadUrl = hit.url;
                     fileSize = hit.fileSize || 0;
+                    rdLink = hit.rdLink || null;
                     // fromCache stays false so next-episode pre-resolve still fires
                 }
             }
@@ -257,7 +262,8 @@ async function handleResolve(req, res) {
                 const result = await pendingResolves.get(resolveKey);
                 downloadUrl = result.url;
                 fileSize = result.fileSize || 0;
-                resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize, expiry: Date.now() + RESOLVE_CACHE_TTL });
+                rdLink = result.rdLink || null;
+                resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize, rdLink, expiry: Date.now() + RESOLVE_CACHE_TTL });
             }
         }
 
@@ -282,9 +288,26 @@ async function handleResolve(req, res) {
             });
         }
 
-        // 302 redirect — player connects directly to RD CDN
-        res.set('Cache-Control', 'private, max-age=2400');
-        res.redirect(302, downloadUrl);
+        // Build refresh callback — re-unrestricts the original RD link for a fresh CDN URL
+        const refreshUrl = rdLink ? async () => {
+            console.log(`[proxy] Re-unrestricting RD link for ${hash.slice(0, 8)}...`);
+            const freshResult = await rd.unrestrictLink(rdToken, rdLink, { force: true });
+            if (!freshResult || !freshResult.download) {
+                throw new Error('Failed to re-unrestrict link');
+            }
+            const newUrl = freshResult.download;
+            // Update the resolve cache with the fresh URL
+            const cacheEntry = resolvedUrlCache.get(resolveKey);
+            if (cacheEntry) {
+                resolvedUrlCache.set(resolveKey, { ...cacheEntry, url: newUrl, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            }
+            console.log(`[proxy] Refreshed CDN URL for ${hash.slice(0, 8)}...`);
+            return newUrl;
+        } : null;
+
+        // Stream proxy — addon pipes video data from RD CDN to the player.
+        // When the CDN link expires mid-stream, refreshUrl transparently gets a fresh URL.
+        proxyStream(req, res, downloadUrl, refreshUrl);
     } catch (err) {
         if (err.name === 'AbortError') return;
         console.error(`[resolve] Error:`, err.cause ? `${err.message} - ${err.cause.message}` : err.message);
@@ -306,9 +329,11 @@ async function handleResolveHead(req, res) {
 
     try {
         let downloadUrl;
+        let rdLink = null;
         const cached = resolvedUrlCache.get(resolveKey);
         if (cached && cached.expiry > Date.now()) {
             downloadUrl = cached.url;
+            rdLink = cached.rdLink || null;
         } else {
             // Join an in-flight pre-resolve if one exists — avoids a duplicate RD API call.
             if (preResolveInFlight.has(resolveKey)) {
@@ -316,6 +341,7 @@ async function handleResolveHead(req, res) {
                 const hit = resolvedUrlCache.get(resolveKey);
                 if (hit && hit.expiry > Date.now()) {
                     downloadUrl = hit.url;
+                    rdLink = hit.rdLink || null;
                 }
             }
             if (!downloadUrl) {
@@ -326,12 +352,27 @@ async function handleResolveHead(req, res) {
                 }
                 const result = await pendingResolves.get(resolveKey);
                 downloadUrl = result.url;
-                resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize: result.fileSize || 0, expiry: Date.now() + RESOLVE_CACHE_TTL });
+                rdLink = result.rdLink || null;
+                resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize: result.fileSize || 0, rdLink, expiry: Date.now() + RESOLVE_CACHE_TTL });
             }
         }
 
-        res.set('Cache-Control', 'private, max-age=2400');
-        res.redirect(302, downloadUrl);
+        // Build refresh callback for HEAD requests too
+        const refreshUrl = rdLink ? async () => {
+            const freshResult = await rd.unrestrictLink(rdToken, rdLink, { force: true });
+            if (!freshResult || !freshResult.download) {
+                throw new Error('Failed to re-unrestrict link');
+            }
+            const newUrl = freshResult.download;
+            const cacheEntry = resolvedUrlCache.get(resolveKey);
+            if (cacheEntry) {
+                resolvedUrlCache.set(resolveKey, { ...cacheEntry, url: newUrl, expiry: Date.now() + RESOLVE_CACHE_TTL });
+            }
+            return newUrl;
+        } : null;
+
+        // proxyStream handles HEAD requests — sends headers without body
+        proxyStream(req, res, downloadUrl, refreshUrl);
     } catch (err) {
         if (!res.headersSent) res.status(502).end();
     }
