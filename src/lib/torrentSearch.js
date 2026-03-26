@@ -195,22 +195,10 @@ async function searchTorrentGalaxy(query) {
                 seeds.push(parseInt(m[1], 10) || 0);
             }
 
-            function parseSizeStr(str) {
-                const sm = str.match(/([\d.]+)\s*(GB|MB|KB|TB)/i);
-                if (!sm) return 0;
-                const val = parseFloat(sm[1]);
-                const unit = sm[2].toUpperCase();
-                if (unit === 'TB') return Math.round(val * 1099511627776);
-                if (unit === 'GB') return Math.round(val * 1073741824);
-                if (unit === 'MB') return Math.round(val * 1048576);
-                if (unit === 'KB') return Math.round(val * 1024);
-                return 0;
-            }
-
             for (let i = 0; i < magnets.length; i++) {
                 const magnetUri = magnets[i];
                 const hashMatch = magnetUri.match(/btih:([a-fA-F0-9]{40})/i)
-                    || magnetUri.match(/btih:([a-zA-Z2-7]{32})/i);
+                    || magnetUri.match(/btih:([A-Z2-7]{32})/);
                 if (!hashMatch) continue;
 
                 results.push({
@@ -229,6 +217,163 @@ async function searchTorrentGalaxy(query) {
     }
 
     return [];
+}
+
+// Search 1337x via HTML scraping (search page + detail pages for magnets)
+async function search1337x(query) {
+    try {
+        const searchUrl = `https://1337x.to/sort-search/${encodeURIComponent(query)}/seeders/desc/1/`;
+        const res = await fetch(searchUrl, {
+            headers: { 'User-Agent': BROWSER_UA },
+            redirect: 'follow',
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return [];
+
+        const html = await res.text();
+
+        // Parse search results table rows for title, detail URL, seeds, size
+        const rowRegex = /<td class="coll-1 name">[\s\S]*?<a href="(\/torrent\/\d+\/[^/]+\/)"[^>]*>([^<]+)<\/a>[\s\S]*?<td class="coll-2 seeds">(\d+)<\/td>[\s\S]*?<td class="coll-4 size[^"]*">([^<]+)<span/g;
+        const entries = [];
+        let m;
+        while ((m = rowRegex.exec(html)) !== null) {
+            entries.push({
+                detailPath: m[1],
+                title: m[2].trim(),
+                seeds: parseInt(m[3], 10) || 0,
+                sizeStr: m[4].trim(),
+            });
+        }
+
+        if (entries.length === 0) return [];
+
+        // Take top 8 results and fetch detail pages in parallel for magnet links
+        const top = entries.slice(0, 8);
+        const detailFetches = top.map(async (entry) => {
+            try {
+                const detailRes = await fetch(`https://1337x.to${entry.detailPath}`, {
+                    headers: { 'User-Agent': BROWSER_UA },
+                    redirect: 'follow',
+                    signal: AbortSignal.timeout(5000),
+                });
+                if (!detailRes.ok) return null;
+
+                const detailHtml = await detailRes.text();
+                const magnetMatch = detailHtml.match(/href="(magnet:\?xt=urn:btih:[^"]+)"/);
+                if (!magnetMatch) return null;
+
+                const magnetUri = magnetMatch[1];
+                const hashMatch = magnetUri.match(/btih:([a-fA-F0-9]{40})/i)
+                    || magnetUri.match(/btih:([A-Z2-7]{32})/);
+                if (!hashMatch) return null;
+
+                return {
+                    hash: hashMatch[1].toLowerCase(),
+                    title: entry.title,
+                    size: parseSizeStr(entry.sizeStr),
+                    seeds: entry.seeds,
+                    source: '1337x',
+                };
+            } catch {
+                return null;
+            }
+        });
+
+        const detailResults = await Promise.all(detailFetches);
+        return detailResults.filter(r => r !== null);
+    } catch (err) {
+        console.error('[search] 1337x error:', err.message);
+        return [];
+    }
+}
+
+// Search KickassTorrents via HTML scraping
+async function searchKickass(query) {
+    const domains = ['https://kickasstorrents.to', 'https://katcr.to'];
+
+    for (const domain of domains) {
+        try {
+            const url = `${domain}/usearch/${encodeURIComponent(query)}/?field=seeders&sorder=desc`;
+            const res = await fetch(url, {
+                headers: { 'User-Agent': BROWSER_UA },
+                redirect: 'follow',
+                signal: AbortSignal.timeout(10000),
+            });
+            if (!res.ok) {
+                console.error(`[search] KAT ${domain} returned ${res.status}, trying next`);
+                continue;
+            }
+
+            const html = await res.text();
+            const results = [];
+
+            // Extract magnet links
+            const magnetRegex = /href="(magnet:\?xt=urn:btih:[^"]+)"/g;
+            const magnets = [];
+            let m;
+            while ((m = magnetRegex.exec(html)) !== null) {
+                magnets.push(m[1]);
+            }
+
+            // Extract titles from main torrent links — strip any inner tags (e.g. <strong>) before capturing text
+            const titleRegex = /<a class="cellMainLink"[^>]*>([\s\S]*?)<\/a>/g;
+            const titles = [];
+            while ((m = titleRegex.exec(html)) !== null) {
+                titles.push(m[1].replace(/<[^>]+>/g, '').trim());
+            }
+
+            // Extract seeders — class order varies by KAT domain ("green center" vs "center green")
+            const seedRegex = /<td[^>]+class="[^"]*\bgreen\b[^"]*"[^>]*>(\d+)<\/td>/g;
+            const seeds = [];
+            while ((m = seedRegex.exec(html)) !== null) {
+                seeds.push(parseInt(m[1], 10) || 0);
+            }
+
+            // Extract sizes
+            const sizeRegex = /<td class="nobr center">([^<]+)<\/td>/g;
+            const sizes = [];
+            while ((m = sizeRegex.exec(html)) !== null) {
+                const sizeStr = m[1].trim();
+                if (/\d/.test(sizeStr) && /[GMKT]B/i.test(sizeStr)) {
+                    sizes.push(sizeStr);
+                }
+            }
+
+            for (let i = 0; i < magnets.length; i++) {
+                const magnetUri = magnets[i];
+                const hashMatch = magnetUri.match(/btih:([a-fA-F0-9]{40})/i)
+                    || magnetUri.match(/btih:([A-Z2-7]{32})/);
+                if (!hashMatch) continue;
+
+                results.push({
+                    hash: hashMatch[1].toLowerCase(),
+                    title: titles[i] || 'Unknown',
+                    size: sizes[i] ? parseSizeStr(sizes[i]) : 0,
+                    seeds: seeds[i] || 0,
+                    source: 'KAT',
+                });
+            }
+
+            return results;
+        } catch (err) {
+            console.error(`[search] KAT error (${domain}):`, err.message);
+        }
+    }
+
+    return [];
+}
+
+// Shared helper: parse human-readable size string to bytes
+function parseSizeStr(str) {
+    const sm = str.match(/([\d.]+)\s*(GB|MB|KB|TB)/i);
+    if (!sm) return 0;
+    const val = parseFloat(sm[1]);
+    const unit = sm[2].toUpperCase();
+    if (unit === 'TB') return Math.round(val * 1099511627776);
+    if (unit === 'GB') return Math.round(val * 1073741824);
+    if (unit === 'MB') return Math.round(val * 1048576);
+    if (unit === 'KB') return Math.round(val * 1024);
+    return 0;
 }
 
 // Search Knaben meta-search engine via JSON API
@@ -383,6 +528,8 @@ async function liveSearch(imdbId, type, title, year, season, episode) {
         { name: 'Knaben', fn: () => searchKnaben(query) },
         { name: 'CSV', fn: () => searchTorrentsCSV(query) },
         { name: 'Zilean', fn: () => searchZilean(imdbId, season, episode) },
+        { name: '1337x', fn: () => search1337x(query) },
+        { name: 'KAT', fn: () => searchKickass(query) },
     ];
 
     if (type === 'series') {
