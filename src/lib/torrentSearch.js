@@ -44,6 +44,13 @@ function normalizeTitle(title) {
     return title.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]/g, '');
 }
 
+// Extract significant words from a title for fuzzy matching
+const STOP_WORDS = new Set(['a', 'an']);
+function titleWords(title) {
+    return title.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9\s]/g, '').split(/\s+/)
+        .filter(w => w.length > 0 && !STOP_WORDS.has(w));
+}
+
 // Search ThePirateBay via apibay
 async function searchTPB(query) {
     try {
@@ -501,34 +508,47 @@ function filterEpisode(torrents, season, episode) {
     return [];
 }
 
-// Filter torrents to matching title (reject "Paradise PD" when looking for "Paradise")
+// Filter torrents to matching title using word-overlap matching.
+// Handles &/and, colons, hyphens, subtitles, "The" prefix, etc.
 function filterByTitle(torrents, title, year, type) {
+    const reqWords = titleWords(title);
     const normalizedReq = normalizeTitle(title);
+    if (reqWords.length === 0) return torrents;
 
     const filtered = torrents.filter(t => {
         const parsed = parse(t.title);
+
+        // Year mismatch for movies — reject early
+        if (type === 'movie' && year && parsed.year && parsed.year !== year) return false;
+
         const normalizedTorrent = normalizeTitle(parsed.title);
 
-        // Exact match after normalization
-        if (normalizedTorrent === normalizedReq) {
-            if (type === 'movie' && year && parsed.year && parsed.year !== year) return false;
-            return true;
+        // Exact normalized match — always accept
+        if (normalizedTorrent === normalizedReq) return true;
+
+        // Word-overlap: count how many request words appear in the torrent title
+        const torrentWords = new Set(titleWords(parsed.title));
+        let matches = 0;
+        for (const w of reqWords) {
+            if (torrentWords.has(w)) matches++;
         }
 
-        // Substring match — one title contains the other (handles subtitles, colons, etc.)
-        if (normalizedTorrent.includes(normalizedReq) || normalizedReq.includes(normalizedTorrent)) {
-            // Require the lengths to be close to avoid "The Flash" matching "The Flash Gordon Adventures"
-            const lenRatio = Math.min(normalizedTorrent.length, normalizedReq.length) /
-                             Math.max(normalizedTorrent.length, normalizedReq.length);
-            if (lenRatio < 0.7) return false;
-            if (type === 'movie' && year && parsed.year && parsed.year !== year) return false;
-            return true;
+        const overlap = matches / reqWords.length;
+        const torrentWordCount = torrentWords.size;
+
+        // Short titles (1-2 words): all words must match AND torrent word count
+        // must be close (avoids "Paradise" matching "Paradise PD")
+        if (reqWords.length <= 2) {
+            if (overlap < 1.0) return false;
+            return torrentWordCount <= reqWords.length;
         }
+
+        // Longer titles: 80% word overlap is a match
+        if (overlap >= 0.8) return true;
 
         return false;
     });
 
-    // No match — return empty, NOT the unfiltered list
     return filtered;
 }
 

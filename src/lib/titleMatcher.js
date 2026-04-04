@@ -9,33 +9,39 @@ function normalize(title) {
         .trim();
 }
 
+// Extract significant words from a title for fuzzy matching
+const STOP_WORDS = new Set(['a', 'an']);
+function titleWords(title) {
+    return title.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9\s]/g, '').split(/\s+/)
+        .filter(w => w.length > 0 && !STOP_WORDS.has(w));
+}
+
 // Check if a torrent filename matches a target title/year
 function matchesTorrent(torrent, targetTitle, targetYear) {
     const parsed = parse(torrent.filename);
-    const normalizedTarget = normalize(targetTitle);
-    const normalizedParsed = normalize(parsed.title);
+
+    // Year mismatch — reject early
+    if (targetYear && parsed.year && parsed.year !== targetYear) return false;
 
     // Exact normalized match
-    if (normalizedParsed === normalizedTarget) {
-        // If both have years, they must match
-        if (targetYear && parsed.year && parsed.year !== targetYear) return false;
-        return true;
-    }
+    if (normalize(parsed.title) === normalize(targetTitle)) return true;
 
-    // Check if one contains the other (for titles with subtitles, etc.)
-    if (normalizedParsed.includes(normalizedTarget) || normalizedTarget.includes(normalizedParsed)) {
-        if (targetYear && parsed.year && parsed.year !== targetYear) return false;
-        // Require year match for substring matches to avoid false positives
-        if (targetYear && parsed.year && parsed.year === targetYear) return true;
-        // If no year info, accept substring match only if lengths are close
-        if (!targetYear || !parsed.year) {
-            const lenRatio = Math.min(normalizedParsed.length, normalizedTarget.length) /
-                             Math.max(normalizedParsed.length, normalizedTarget.length);
-            return lenRatio > 0.7;
-        }
+    // Word-overlap matching
+    const reqWords = titleWords(targetTitle);
+    if (reqWords.length === 0) return true;
+    const torrentWords = new Set(titleWords(parsed.title));
+    let matches = 0;
+    for (const w of reqWords) {
+        if (torrentWords.has(w)) matches++;
     }
+    const overlap = matches / reqWords.length;
 
-    return false;
+    // Short titles: all words must match, torrent word count must be close
+    if (reqWords.length <= 2) {
+        if (overlap < 1.0) return false;
+        return torrentWords.size <= reqWords.length;
+    }
+    return overlap >= 0.7;
 }
 
 // Find video files in a torrent that match a specific season/episode
