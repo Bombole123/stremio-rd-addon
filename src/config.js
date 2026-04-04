@@ -30,6 +30,7 @@ const defaultSettings = {
     qualities: ['2160p', '1080p', '720p', '480p'],
     preferredCodec: 'all',
     languageFilter: 'all',
+    preferredLanguage: 'english',
     maxFileSize: 0,
 };
 

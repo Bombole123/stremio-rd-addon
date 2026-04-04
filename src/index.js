@@ -610,6 +610,20 @@ function getConfigurePage(options = {}) {
                     <option value="multi" ${s.languageFilter === 'multi' ? 'selected' : ''}>Multi/Dual Audio</option>
                 </select>
             </div>
+            <div>
+                <label for="preferredLanguage">Preferred Language</label>
+                <select id="preferredLanguage">
+                    <option value="english" ${s.preferredLanguage === 'english' ? 'selected' : ''}>English</option>
+                    <option value="spanish" ${s.preferredLanguage === 'spanish' ? 'selected' : ''}>Spanish</option>
+                    <option value="french" ${s.preferredLanguage === 'french' ? 'selected' : ''}>French</option>
+                    <option value="german" ${s.preferredLanguage === 'german' ? 'selected' : ''}>German</option>
+                    <option value="italian" ${s.preferredLanguage === 'italian' ? 'selected' : ''}>Italian</option>
+                    <option value="portuguese" ${s.preferredLanguage === 'portuguese' ? 'selected' : ''}>Portuguese</option>
+                    <option value="russian" ${s.preferredLanguage === 'russian' ? 'selected' : ''}>Russian</option>
+                    <option value="multi" ${s.preferredLanguage === 'multi' ? 'selected' : ''}>Multi</option>
+                    <option value="any" ${s.preferredLanguage === 'any' ? 'selected' : ''}>Any (no preference)</option>
+                </select>
+            </div>
         </div>
 
         <div class="settings-row">
@@ -697,6 +711,7 @@ function getConfigurePage(options = {}) {
                 qualities: qualities,
                 preferredCodec: document.getElementById('preferredCodec').value,
                 languageFilter: document.getElementById('languageFilter').value,
+                preferredLanguage: document.getElementById('preferredLanguage').value,
                 maxFileSize: parseFloat(document.getElementById('maxFileSize').value) || 0
             };
         }
@@ -938,6 +953,7 @@ app.post('/api/save-config', async (req, res) => {
             qualities: (settings.qualities || []).filter(q => validQualities.includes(q)),
             preferredCodec: settings.preferredCodec || 'all',
             languageFilter: ['all', 'english', 'multi'].includes(settings.languageFilter) ? settings.languageFilter : 'all',
+            preferredLanguage: ['english', 'spanish', 'french', 'german', 'italian', 'portuguese', 'russian', 'multi', 'any'].includes(settings.preferredLanguage) ? settings.preferredLanguage : 'english',
             maxFileSize: Math.max(parseFloat(settings.maxFileSize) || 0, 0),
         };
         if (toSave.settings.qualities.length === 0) {

@@ -32,14 +32,35 @@ function buildMultiCriteriaComparator(sortPriority) {
         if (!source) return -1;
         return sourceRank[source.toLowerCase().replace(/[\s.]/g, '')] ?? -1;
     }
+    const langAliases = {
+        english: ['english', 'eng', 'en'],
+        spanish: ['spanish', 'spa', 'es', 'español'],
+        french: ['french', 'fra', 'fr', 'français'],
+        german: ['german', 'ger', 'de', 'deu', 'deutsch'],
+        italian: ['italian', 'ita', 'it'],
+        portuguese: ['portuguese', 'por', 'pt'],
+        russian: ['russian', 'rus', 'ru'],
+        multi: ['multi', 'dual'],
+    };
+    function isLanguageMatch(lang, preferred) {
+        const codes = langAliases[preferred] || [preferred];
+        return codes.includes(lang);
+    }
     function langRank(lang) {
-        if (!lang) return 3; // No language tag = assumed English, highest rank
+        const preferred = (config.settings.preferredLanguage || 'english').toLowerCase();
+        if (preferred === 'any') return 1;
+        if (!lang) {
+            // No language tag — if preferred is English, assume English (rank 3)
+            return preferred === 'english' ? 3 : 0;
+        }
         const l = Array.isArray(lang) ? lang[0] : lang;
-        if (!l) return 3;
+        if (!l) return preferred === 'english' ? 3 : 0;
         const lower = l.toLowerCase();
-        if (lower === 'english' || lower === 'eng' || lower === 'en') return 3;
+        if (isLanguageMatch(lower, preferred)) return 3;
         if (lower === 'multi') return 2;
-        return 1; // other known language
+        // English still gets a small boost above other languages when not preferred
+        if (preferred !== 'english' && (lower === 'english' || lower === 'eng' || lower === 'en')) return 1.5;
+        return 1;
     }
     const comparators = {
         quality: (a, b) => (qualityRank[b._quality] || 0) - (qualityRank[a._quality] || 0),
