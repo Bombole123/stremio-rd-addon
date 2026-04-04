@@ -481,19 +481,21 @@ async function searchZilean(imdbId, season, episode) {
 
 // Filter torrents to matching episode/season
 function filterEpisode(torrents, season, episode) {
-    // Strict: exact season+episode match
+    // Exact season+episode matches
     const exact = torrents.filter(t => {
         const parsed = parse(t.title);
         return parsed.season === season && parsed.episode === episode;
     });
-    if (exact.length > 0) return exact;
 
     // Season packs: season matches but no episode in title (full season downloads)
     const packs = torrents.filter(t => {
         const parsed = parse(t.title);
         return parsed.season === season && parsed.episode === null;
     });
-    if (packs.length > 0) return packs;
+
+    // Return both exact matches and season packs together
+    const combined = [...exact, ...packs];
+    if (combined.length > 0) return combined;
 
     // No match — return empty, NOT the unfiltered list
     return [];
@@ -667,6 +669,7 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
     // Check SQLite for persistent cached results
     const dbResults = torrentDb.getTorrents(imdbId);
     const isFresh = torrentDb.isFresh(imdbId);
+    let result;
 
     if (dbResults.length > 0) {
         // Convert DB rows to torrent objects
@@ -686,35 +689,64 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
             torrents = filterEpisode(torrents, season, episode);
         }
 
-        // Cache in memory for this session
-        cache.set(cacheKey, torrents, CACHE_TTL);
-
         if (isFresh) {
             console.log(`[search] DB hit (fresh): ${torrents.length} torrents for "${title}"`);
-            return torrents;
+        } else {
+            // Stale — return immediately but refresh in background
+            console.log(`[search] DB hit (stale): ${torrents.length} torrents for "${title}" — refreshing in background`);
+            refreshInBackground(imdbId, type, title, year, season, episode, cacheKey);
         }
 
-        // Stale — return immediately but refresh in background
-        console.log(`[search] DB hit (stale): ${torrents.length} torrents for "${title}" — refreshing in background`);
-        refreshInBackground(imdbId, type, title, year, season, episode, cacheKey);
-        return torrents;
+        result = torrents;
+    } else {
+        // No DB results — do live search
+        console.log(`[search] DB miss for "${title}" — searching live`);
+        const torrents = await liveSearch(imdbId, type, title, year, season, episode);
+
+        // Save to DB
+        torrentDb.saveTorrents(imdbId, torrents);
+
+        // Filter to matching title, then filter episode for series
+        let filtered = filterByTitle(torrents, title, year, type);
+        if (type === 'series' && season !== null && episode !== null) {
+            filtered = filterEpisode(filtered, season, episode);
+        }
+
+        result = filtered;
     }
 
-    // No DB results — do live search
-    console.log(`[search] DB miss for "${title}" — searching live`);
-    const torrents = await liveSearch(imdbId, type, title, year, season, episode);
-
-    // Save to DB and memory cache
-    torrentDb.saveTorrents(imdbId, torrents);
-
-    // Filter to matching title, then filter episode for series
-    let filtered = filterByTitle(torrents, title, year, type);
+    // Season pack fallback: if searching for a specific episode and no season packs
+    // were found, do a second search with season-only query to discover packs
     if (type === 'series' && season !== null && episode !== null) {
-        filtered = filterEpisode(filtered, season, episode);
+        const hasPacks = result.some(t => {
+            const p = parse(t.title);
+            return p.season === parseInt(season) && !p.episode;
+        });
+
+        if (!hasPacks) {
+            console.log(`[search] No season packs found, searching for S${String(season).padStart(2, '0')} packs...`);
+            const packTorrents = await liveSearch(imdbId, type, title, year, season, null);
+            if (packTorrents.length > 0) {
+                torrentDb.saveTorrents(imdbId, packTorrents);
+                let packs = filterByTitle(packTorrents, title, year, type);
+                // Keep only actual season packs (matching season, no episode)
+                packs = packs.filter(t => {
+                    const p = parse(t.title);
+                    return p.season === parseInt(season) && !p.episode;
+                });
+                // Deduplicate — skip hashes already in results
+                const existingHashes = new Set(result.map(t => t.hash));
+                packs = packs.filter(t => !existingHashes.has(t.hash));
+                if (packs.length > 0) {
+                    result = result.concat(packs);
+                    console.log(`[search] Found ${packs.length} season pack(s)`);
+                }
+            }
+        }
     }
 
-    cache.set(cacheKey, filtered, CACHE_TTL);
-    return filtered;
+    cache.set(cacheKey, result, CACHE_TTL);
+    return result;
 }
 
 module.exports = { searchTorrents, sourceStats };
