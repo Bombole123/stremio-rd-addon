@@ -689,18 +689,23 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
             torrents = filterEpisode(torrents, season, episode);
         }
 
-        if (isFresh) {
+        if (torrents.length > 0 && isFresh) {
             console.log(`[search] DB hit (fresh): ${torrents.length} torrents for "${title}"`);
-        } else {
-            // Stale — return immediately but refresh in background
+            result = torrents;
+        } else if (torrents.length > 0) {
+            // Stale but has results — return immediately, refresh in background
             console.log(`[search] DB hit (stale): ${torrents.length} torrents for "${title}" — refreshing in background`);
             refreshInBackground(imdbId, type, title, year, season, episode, cacheKey);
+            result = torrents;
+        } else {
+            // DB had results but none match this episode/title — fall through to live search
+            console.log(`[search] DB has ${dbResults.length} entries but none match — searching live`);
         }
+    }
 
-        result = torrents;
-    } else {
-        // No DB results — do live search
-        console.log(`[search] DB miss for "${title}" — searching live`);
+    if (result === undefined) {
+        // No usable DB results — do live search
+        if (dbResults.length === 0) console.log(`[search] DB miss for "${title}" — searching live`);
         const torrents = await liveSearch(imdbId, type, title, year, season, episode);
 
         // Save to DB
