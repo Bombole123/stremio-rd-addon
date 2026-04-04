@@ -41,7 +41,7 @@ setInterval(() => {
 }, 10 * 60 * 1000).unref();
 
 function normalizeTitle(title) {
-    return title.toLowerCase().replace(/[^a-z0-9]/g, '');
+    return title.toLowerCase().replace(/&/g, 'and').replace(/[^a-z0-9]/g, '');
 }
 
 // Search ThePirateBay via apibay
