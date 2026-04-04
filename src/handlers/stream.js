@@ -33,9 +33,9 @@ function buildMultiCriteriaComparator(sortPriority) {
         return sourceRank[source.toLowerCase().replace(/[\s.]/g, '')] ?? -1;
     }
     function langRank(lang) {
-        if (!lang) return 0;
+        if (!lang) return 3; // No language tag = assumed English, highest rank
         const l = Array.isArray(lang) ? lang[0] : lang;
-        if (!l) return 0;
+        if (!l) return 3;
         const lower = l.toLowerCase();
         if (lower === 'english' || lower === 'eng' || lower === 'en') return 3;
         if (lower === 'multi') return 2;
