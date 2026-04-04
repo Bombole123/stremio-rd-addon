@@ -481,13 +481,22 @@ async function searchZilean(imdbId, season, episode) {
 
 // Filter torrents to matching episode/season
 function filterEpisode(torrents, season, episode) {
-    const filtered = torrents.filter(t => {
+    // Strict: exact season+episode match
+    const exact = torrents.filter(t => {
         const parsed = parse(t.title);
-        if (parsed.season === season && parsed.episode === episode) return true;
-        if (parsed.season === season && parsed.episode === null) return true;
-        return false;
+        return parsed.season === season && parsed.episode === episode;
     });
-    return filtered.length > 0 ? filtered : torrents;
+    if (exact.length > 0) return exact;
+
+    // Season packs: season matches but no episode in title (full season downloads)
+    const packs = torrents.filter(t => {
+        const parsed = parse(t.title);
+        return parsed.season === season && parsed.episode === null;
+    });
+    if (packs.length > 0) return packs;
+
+    // No match — return empty, NOT the unfiltered list
+    return [];
 }
 
 // Filter torrents to matching title (reject "Paradise PD" when looking for "Paradise")
@@ -498,16 +507,27 @@ function filterByTitle(torrents, title, year, type) {
         const parsed = parse(t.title);
         const normalizedTorrent = normalizeTitle(parsed.title);
 
-        // Title must match exactly after normalization
-        if (normalizedTorrent !== normalizedReq) return false;
+        // Exact match after normalization
+        if (normalizedTorrent === normalizedReq) {
+            if (type === 'movie' && year && parsed.year && parsed.year !== year) return false;
+            return true;
+        }
 
-        // For movies: if both have a year, they must match
-        if (type === 'movie' && year && parsed.year && parsed.year !== year) return false;
+        // Substring match — one title contains the other (handles subtitles, colons, etc.)
+        if (normalizedTorrent.includes(normalizedReq) || normalizedReq.includes(normalizedTorrent)) {
+            // Require the lengths to be close to avoid "The Flash" matching "The Flash Gordon Adventures"
+            const lenRatio = Math.min(normalizedTorrent.length, normalizedReq.length) /
+                             Math.max(normalizedTorrent.length, normalizedReq.length);
+            if (lenRatio < 0.7) return false;
+            if (type === 'movie' && year && parsed.year && parsed.year !== year) return false;
+            return true;
+        }
 
-        return true;
+        return false;
     });
 
-    return filtered.length > 0 ? filtered : torrents;
+    // No match — return empty, NOT the unfiltered list
+    return filtered;
 }
 
 // Live search — queries all sources in parallel
