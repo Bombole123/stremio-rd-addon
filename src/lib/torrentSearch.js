@@ -2,6 +2,7 @@ const Cache = require('./cache');
 const config = require('../config');
 const { parse } = require('./nameParser');
 const torrentDb = require('./torrentDb');
+const { searchTorrentio } = require('./torrentioApi');
 
 const cache = new Cache();
 const CACHE_TTL = 30 * 60 * 1000; // 30 minutes — in-memory cache for dedup within session
@@ -685,6 +686,19 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
     // Check in-memory cache first (avoids SQLite reads for rapid re-requests)
     const memCached = cache.get(cacheKey);
     if (memCached) return memCached;
+
+    // --- Torrentio as primary source ---
+    // Torrentio already matches by IMDB ID, so we trust its results without
+    // title filtering (which can reject valid results with different naming).
+    // searchTorrentio never throws (returns [] on error), so no try/catch needed.
+    const torrentioResults = await searchTorrentio(type, imdbId, season, episode);
+    if (torrentioResults.length > 0) {
+        torrentDb.saveTorrents(imdbId, torrentioResults);
+        console.log(`[search] Torrentio primary: ${torrentioResults.length} torrents for "${title}"`);
+        cache.set(cacheKey, torrentioResults, CACHE_TTL);
+        return torrentioResults;
+    }
+    console.log(`[search] Torrentio returned no results — falling back to DB/live search`);
 
     // Check SQLite for persistent cached results
     const dbResults = torrentDb.getTorrents(imdbId);
