@@ -223,10 +223,18 @@ async function streamHandlerCore(type, id, options = {}) {
                 hints.videoSize = cachedHash.video_size;
             }
 
+            let desc = formatStreamDescriptionFromSearch(torrent.title, parsed, torrent, torrent.size);
+            // Season packs: indicate which episode will play
+            const isSeasonPack = type === 'series' && season !== null && episode !== null
+                && parsed.season !== null && parsed.episode === null;
+            if (isSeasonPack) {
+                desc += `\n📺 Season Pack → E${String(episode).padStart(2, '0')}`;
+            }
+
             streams.push({
                 url: resolveUrl,
                 name: formatStreamName(parsed),
-                description: formatStreamDescriptionFromSearch(torrent.title, parsed, torrent, torrent.size),
+                description: desc,
                 behaviorHints: hints,
                 _quality: parsed.quality || null,
                 _size: torrent.size || 0,
@@ -290,10 +298,18 @@ async function streamHandlerCore(type, id, options = {}) {
                 hints.videoSize = cachedHash.video_size;
             }
 
+            let desc = formatStreamDescriptionFromSearch(torrent.title, parsed, torrent, torrent.size);
+            // Season packs: indicate which episode will play
+            const isSeasonPack = type === 'series' && season !== null && episode !== null
+                && parsed.season !== null && parsed.episode === null;
+            if (isSeasonPack) {
+                desc += `\n📺 Season Pack → E${String(episode).padStart(2, '0')}`;
+            }
+
             streams.push({
                 url: resolveUrl,
                 name: formatStreamName(parsed),
-                description: formatStreamDescriptionFromSearch(torrent.title, parsed, torrent, torrent.size),
+                description: desc,
                 behaviorHints: hints,
                 _quality: parsed.quality || null,
                 _size: torrent.size || 0,
