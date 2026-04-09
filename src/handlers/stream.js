@@ -174,7 +174,7 @@ async function streamHandlerCore(type, id, options = {}) {
 
     // Step 2: Search torrent indexers for hashes
     const searchStart = Date.now();
-    const torrents = await searchTorrents(imdbId, type, meta.name, meta.year, season, episode);
+    const { torrents, fromTorrentio } = await searchTorrents(imdbId, type, meta.name, meta.year, season, episode);
     const searchMs = Date.now() - searchStart;
     if (torrents.length === 0) {
         console.log(`[stream] No torrents found from indexers`);
@@ -196,81 +196,116 @@ async function streamHandlerCore(type, id, options = {}) {
     const uniqueTorrents = [...deduped.values()];
     console.log(`[stream] ${torrents.length} torrents deduplicated to ${uniqueTorrents.length}`);
 
-    // Sort torrents by likelihood of being cached on RD before hash extraction
-    uniqueTorrents.sort((a, b) => {
-        // Highest seeds first
-        const seedDiff = (b.seeds || 0) - (a.seeds || 0);
-        if (seedDiff !== 0) return seedDiff;
-        // Then by size descending
-        return (b.size || 0) - (a.size || 0);
-    });
-
-    // Build torrent map with parsed quality for prioritized cache checking
-    const torrentMap = new Map();
-    for (const t of uniqueTorrents) {
-        const parsed = parse(t.title);
-        torrentMap.set(t.hash, { ...t, _parsedQuality: parsed.quality || 'unknown' });
-    }
-
-    const hashes = uniqueTorrents.map((t) => t.hash);
-    console.log(`[stream] Checking ${hashes.length} hashes against RD cache`);
-
-    // Step 3: Check which hashes are cached (parallel + prioritized + early termination)
-    const cacheStart = Date.now();
-    const availability = await rd.checkInstantAvailability(rdToken, hashes, torrentMap);
-    const cacheMs = Date.now() - cacheStart;
     const streams = [];
+    let cacheMs = 0;
 
-    for (const hash of hashes) {
-        const info = availability[hash];
-        if (!info || !info.rd || info.rd.length === 0) continue;
+    if (fromTorrentio && uniqueTorrents.length > 0) {
+        // Torrentio path: skip RD cache check, build streams directly.
+        // Resolution happens on-demand via /resolve/{hash} when user clicks.
+        for (const torrent of uniqueTorrents) {
+            const parsed = parse(torrent.title);
+            const resolveBase = userId ? `${config.tunnelUrl}/${userId}` : config.tunnelUrl;
+            const queryParams = [`type=${type}`, `imdbId=${imdbId}`];
+            if (type === 'series' && season !== null && episode !== null) {
+                queryParams.push(`season=${season}`, `episode=${episode}`);
+            }
+            const resolveUrl = `${resolveBase}/resolve/${torrent.hash}?${queryParams.join('&')}`;
 
-        const torrent = torrentMap.get(hash);
-        if (!torrent) continue;
+            const hashKey = `${torrent.hash}:${season || ''}:${episode || ''}`;
+            const cachedHash = getVideoHash(hashKey);
 
-        const parsed = parse(torrent.title);
+            const hints = {
+                filename: torrent.title,
+                bingeGroup: season !== null ? `rd-${torrent.hash}` : undefined,
+            };
+            if (cachedHash) {
+                hints.videoHash = cachedHash.video_hash;
+                hints.videoSize = cachedHash.video_size;
+            }
 
-        // Build resolve URL — include userId prefix for per-user routing
-        const resolveBase = userId ? `${config.tunnelUrl}/${userId}` : config.tunnelUrl;
-        let resolveUrl = `${resolveBase}/resolve/${torrent.hash}`;
-        const queryParams = [`type=${type}`, `imdbId=${imdbId}`];
-        if (type === 'series' && season !== null && episode !== null) {
-            queryParams.push(`season=${season}`);
-            queryParams.push(`episode=${episode}`);
+            streams.push({
+                url: resolveUrl,
+                name: formatStreamName(parsed),
+                description: formatStreamDescriptionFromSearch(torrent.title, parsed, torrent, torrent.size),
+                behaviorHints: hints,
+                _quality: parsed.quality || null,
+                _size: torrent.size || 0,
+                _seeds: torrent.seeds || 0,
+                _codec: parsed.codec || null,
+                _source: parsed.source || null,
+                _language: parsed.language || null,
+            });
         }
-        resolveUrl += '?' + queryParams.join('&');
-
-        // Look up pre-computed OpenSubtitles hash for instant subtitle loading
-        const hashKey = `${torrent.hash}:${season || ''}:${episode || ''}`;
-        const cachedHash = getVideoHash(hashKey);
-
-        const hints = {
-            filename: torrent.title,
-            bingeGroup: season !== null ? `rd-${torrent.hash}` : undefined,
-        };
-        if (cachedHash) {
-            hints.videoHash = cachedHash.video_hash;
-            hints.videoSize = cachedHash.video_size;
-        }
-        // Don't set videoSize from torrent.size — it's the whole torrent, not the video file.
-        // Incorrect videoSize causes ExoPlayer audio desync. Only use the real file size
-        // from OpenSubtitles hash computation (cachedHash above).
-
-        streams.push({
-            url: resolveUrl,
-            name: formatStreamName(parsed),
-            description: formatStreamDescriptionFromSearch(torrent.title, parsed, torrent, torrent.size),
-            behaviorHints: hints,
-            _quality: parsed.quality || null,
-            _size: torrent.size || 0,
-            _seeds: torrent.seeds || 0,
-            _codec: parsed.codec || null,
-            _source: parsed.source || null,
-            _language: parsed.language || null,
+        console.log(`[stream] Torrentio instant: ${streams.length} streams (no RD cache check)`);
+    } else {
+        // Fallback path: check RD cache, only return cached streams
+        // Sort torrents by likelihood of being cached on RD before hash extraction
+        uniqueTorrents.sort((a, b) => {
+            const seedDiff = (b.seeds || 0) - (a.seeds || 0);
+            if (seedDiff !== 0) return seedDiff;
+            return (b.size || 0) - (a.size || 0);
         });
-    }
 
-    console.log(`[stream] ${streams.length} cached streams found`);
+        // Build torrent map with parsed quality for prioritized cache checking
+        const torrentMap = new Map();
+        for (const t of uniqueTorrents) {
+            const parsed = parse(t.title);
+            torrentMap.set(t.hash, { ...t, _parsedQuality: parsed.quality || 'unknown' });
+        }
+
+        const hashes = uniqueTorrents.map((t) => t.hash);
+        console.log(`[stream] Checking ${hashes.length} hashes against RD cache`);
+
+        const cacheStart = Date.now();
+        const availability = await rd.checkInstantAvailability(rdToken, hashes, torrentMap);
+        cacheMs = Date.now() - cacheStart;
+
+        for (const hash of hashes) {
+            const info = availability[hash];
+            if (!info || !info.rd || info.rd.length === 0) continue;
+
+            const torrent = torrentMap.get(hash);
+            if (!torrent) continue;
+
+            const parsed = parse(torrent.title);
+
+            const resolveBase = userId ? `${config.tunnelUrl}/${userId}` : config.tunnelUrl;
+            let resolveUrl = `${resolveBase}/resolve/${torrent.hash}`;
+            const queryParams = [`type=${type}`, `imdbId=${imdbId}`];
+            if (type === 'series' && season !== null && episode !== null) {
+                queryParams.push(`season=${season}`);
+                queryParams.push(`episode=${episode}`);
+            }
+            resolveUrl += '?' + queryParams.join('&');
+
+            const hashKey = `${torrent.hash}:${season || ''}:${episode || ''}`;
+            const cachedHash = getVideoHash(hashKey);
+
+            const hints = {
+                filename: torrent.title,
+                bingeGroup: season !== null ? `rd-${torrent.hash}` : undefined,
+            };
+            if (cachedHash) {
+                hints.videoHash = cachedHash.video_hash;
+                hints.videoSize = cachedHash.video_size;
+            }
+
+            streams.push({
+                url: resolveUrl,
+                name: formatStreamName(parsed),
+                description: formatStreamDescriptionFromSearch(torrent.title, parsed, torrent, torrent.size),
+                behaviorHints: hints,
+                _quality: parsed.quality || null,
+                _size: torrent.size || 0,
+                _seeds: torrent.seeds || 0,
+                _codec: parsed.codec || null,
+                _source: parsed.source || null,
+                _language: parsed.language || null,
+            });
+        }
+
+        console.log(`[stream] ${streams.length} cached streams found`);
+    }
 
     // Apply settings
     const { qualities, preferredCodec, maxFileSize } = config.settings;

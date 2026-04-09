@@ -671,7 +671,7 @@ function refreshInBackground(imdbId, type, title, year, season, episode, cacheKe
             filtered = filterEpisode(filtered, season, episode);
         }
         if (torrents.length > 0) {
-            cache.set(cacheKey, filtered, CACHE_TTL);
+            cache.set(cacheKey, { torrents: filtered, fromTorrentio: false }, CACHE_TTL);
         }
         console.log(`[search] Background refresh complete: ${torrents.length} torrents for "${title}"`);
     }).catch(err => {
@@ -685,7 +685,7 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
 
     // Check in-memory cache first (avoids SQLite reads for rapid re-requests)
     const memCached = cache.get(cacheKey);
-    if (memCached) return memCached;
+    if (memCached) return memCached; // already in { torrents, fromTorrentio } format
 
     // --- Torrentio as primary source ---
     // Torrentio already matches by IMDB ID, so we trust its results without
@@ -695,8 +695,9 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
     if (torrentioResults.length > 0) {
         torrentDb.saveTorrents(imdbId, torrentioResults);
         console.log(`[search] Torrentio primary: ${torrentioResults.length} torrents for "${title}"`);
-        cache.set(cacheKey, torrentioResults, CACHE_TTL);
-        return torrentioResults;
+        const torrentioResult = { torrents: torrentioResults, fromTorrentio: true };
+        cache.set(cacheKey, torrentioResult, CACHE_TTL);
+        return torrentioResult;
     }
     console.log(`[search] Torrentio returned no results — falling back to DB/live search`);
 
@@ -784,8 +785,9 @@ async function searchTorrents(imdbId, type, title, year, season, episode) {
         }
     }
 
-    cache.set(cacheKey, result, CACHE_TTL);
-    return result;
+    const fallbackResult = { torrents: result, fromTorrentio: false };
+    cache.set(cacheKey, fallbackResult, CACHE_TTL);
+    return fallbackResult;
 }
 
 module.exports = { searchTorrents, sourceStats };
