@@ -119,8 +119,12 @@ function proxyStream(req, res, cdnUrl, refreshUrl) {
 
             // Pipe the video data to the player
             pipeline(upstreamRes, res, (err) => {
-                if (err && err.code !== 'ERR_STREAM_PREMATURE_CLOSE' && !res.destroyed) {
-                    console.error('[proxy] Stream pipe error:', err.message);
+                if (err) {
+                    if (err.code === 'ERR_STREAM_PREMATURE_CLOSE' || res.destroyed) {
+                        // Client disconnected or stream ended normally after client left
+                        return;
+                    }
+                    console.error('[proxy] Stream interrupted:', err.code || err.message);
                 }
             });
         });
@@ -143,6 +147,11 @@ function proxyStream(req, res, cdnUrl, refreshUrl) {
 
         // Track only the current live upstream — one close listener at a time
         setActiveUpstream(upstream);
+
+        upstream.setTimeout(30000, () => {
+            console.error('[proxy] Upstream socket timeout (30s no data), aborting');
+            upstream.destroy(new Error('Socket timeout'));
+        });
 
         upstream.end();
     }

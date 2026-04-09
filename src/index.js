@@ -45,6 +45,30 @@ setInterval(() => {
     }
 }, RESOLVE_CACHE_TTL).unref();
 
+// Proactive background refresh — re-unrestricts the RD link before the cache entry expires,
+// so that the cached CDN URL is always fresh when the player seeks or resumes.
+function scheduleProactiveRefresh(resolveKey, rdLink, rdToken) {
+    if (!rdLink) return;
+    const refreshDelay = Math.round(RESOLVE_CACHE_TTL * 0.8); // 80% of TTL = 32 min
+    setTimeout(async () => {
+        const entry = resolvedUrlCache.get(resolveKey);
+        if (!entry || entry.expiry < Date.now()) return; // Already expired or evicted
+        try {
+            const fresh = await rd.unrestrictLink(rdToken, rdLink, { force: true });
+            if (fresh && fresh.download) {
+                resolvedUrlCache.set(resolveKey, {
+                    ...entry,
+                    url: fresh.download,
+                    expiry: Date.now() + RESOLVE_CACHE_TTL,
+                });
+                console.log(`[resolve] Proactive refresh for ${resolveKey.split(':')[1]?.slice(0, 8)}...`);
+            }
+        } catch (err) {
+            console.error('[resolve] Proactive refresh failed:', err.message);
+        }
+    }, refreshDelay).unref();
+}
+
 // Core resolve logic — returns the download URL string or throws
 async function resolveHash(rdToken, hash, type, season, episode, imdbId) {
     const startTime = Date.now();
@@ -264,6 +288,7 @@ async function handleResolve(req, res) {
                 fileSize = result.fileSize || 0;
                 rdLink = result.rdLink || null;
                 resolvedUrlCache.set(resolveKey, { url: downloadUrl, fileSize, rdLink, expiry: Date.now() + RESOLVE_CACHE_TTL });
+                scheduleProactiveRefresh(resolveKey, rdLink, rdToken);
             }
         }
 
